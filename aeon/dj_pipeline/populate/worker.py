@@ -100,6 +100,7 @@ for attr in vars(streams).values():
 
 # streams_worker(qc.CameraQC, max_calls=10)
 streams_worker(tracking.SLEAPTracking, max_calls=10)
+streams_worker(tracking.DenoisedTracking, max_calls=10)
 
 # configure a worker to run the analysis tables
 analysis_worker = DataJointWorker(
