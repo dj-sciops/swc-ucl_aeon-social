@@ -59,8 +59,7 @@ acquisition_worker = DataJointWorker(
     db_prefix=db_prefix,
     run_duration=MAX_RUN_DURATION,
     max_idled_cycle=WORKER_MAX_IDLED_CYCLE,
-    sleep_duration=10,
-)
+    sleep_duration=10,)
 # acquisition_worker(ingest_epochs_chunks)
 acquisition_worker(acquisition.EpochConfig)
 acquisition_worker(acquisition.Environment)
