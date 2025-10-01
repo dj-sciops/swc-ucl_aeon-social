@@ -19,6 +19,9 @@ dj_local_conf.json
 .idea/
 **/*.ipynb_checkpoints
 
+# cursor IDE
+.cursor/
+
 # misc
 **/.DS_Store
 log*.txt
