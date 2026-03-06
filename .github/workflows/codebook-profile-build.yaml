@@ -69,10 +69,10 @@ jobs:
           ec2_spot_instance_strategy: BestEffort    # Other options are: SpotOnly, BestEffort, MaxPerformance
           ec2_instance_tags: >
             [
-              {"Key": "Scope", "Value": "Works"}, 
-              {"Key": "Contract", "Value": "${{github.event.repository.name}}"}, 
+              {"Key": "Scope", "Value": "Works"},
+              {"Key": "Contract", "Value": "${{github.event.repository.name}}"},
               {"Key": "Application", "Value": "codebook-profile-build-runner"},
-              {"Key": "WorkflowVersion", "Value": "${{ inputs.workflow_version }}"}, 
+              {"Key": "WorkflowVersion", "Value": "${{ inputs.workflow_version }}"},
               {"Key": "WorkerType", "Value": "${{ inputs.worker_type }}"}
             ]
   ## Build/Publish codebook env image
