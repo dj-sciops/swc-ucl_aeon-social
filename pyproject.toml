@@ -24,7 +24,7 @@ dependencies = [
   "bottleneck>=1.2.1,<2",
   "datajoint>=0.13.7",
   "datajoint-utilities @ git+https://github.com/datajoint-company/datajoint-utilities",
-  "swc-aeon @ git+https://github.com/SainsburyWellcomeCentre/aeon_api.git",
+  "swc-aeon @ git+https://github.com/SainsburyWellcomeCentre/aeon_api.git@49393f139943744d5a92e2edaaee2a4d1af5323e",
   "fastparquet",
   "graphviz",
   "ipykernel",
