@@ -897,14 +897,17 @@ def step_15_force_insert_sorted_spikes():
     block_start, block_end = get_block_bounds()
     now = datetime.now(timezone.utc)
 
-    # Alignment verification — this MUST pass before we insert any spike data
-    print_info("Running spike alignment verification...")
-    try:
-        _, total_dat, total_pipeline = verify_spike_alignment()
-    except RuntimeError as e:
-        print_fail(f"Alignment check failed: {e}")
-        return False
-    print_ok("Alignment verification passed\n")
+    # Alignment verification — skip if flag set (e.g., Works deployment without raw data)
+    if SKIP_ALIGNMENT:
+        print_info("Skipping spike alignment verification (--skip-alignment flag set)")
+    else:
+        print_info("Running spike alignment verification...")
+        try:
+            _, total_dat, total_pipeline = verify_spike_alignment()
+        except RuntimeError as e:
+            print_fail(f"Alignment check failed: {e}")
+            return False
+        print_ok("Alignment verification passed\n")
 
     for grp in CHANNEL_GROUPS:
         task_key = get_sorting_task_key(grp["name"], block_start, block_end)
