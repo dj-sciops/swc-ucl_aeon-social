@@ -1133,10 +1133,15 @@ def validate_synced_spikes_against_ground_truth():
         # Rebuild per-spike timestamps from our pipeline output
         # SyncedSpikes stores spike_times per unit — we need to interleave them
         # back into the original spike order (matching spike_times.npy order)
+        unit_map = {u["unit"]: u["spike_times"] for u in synced_units}
+
+        # Determine if pipeline times are datetime64 (direct-insert path) or float64
+        sample_times = next(iter(unit_map.values()))
+        pipeline_is_datetime = np.issubdtype(sample_times.dtype, np.datetime64)
+
         our_harp_times = np.empty(len(spike_times_raw), dtype=np.float64)
         our_harp_times[:] = np.nan  # sentinel for unmatched spikes
 
-        unit_map = {u["unit"]: u["spike_times"] for u in synced_units}
         for unit_id, unit_times in unit_map.items():
             mask = spike_clusters == unit_id
             if mask.sum() != len(unit_times):
@@ -1145,7 +1150,11 @@ def validate_synced_spikes_against_ground_truth():
                     f"(KS: {mask.sum()}, pipeline: {len(unit_times)})"
                 )
                 continue
-            our_harp_times[mask] = unit_times
+            # Convert datetime64[ns] to float64 seconds since Unix epoch
+            if pipeline_is_datetime:
+                our_harp_times[mask] = unit_times.astype("datetime64[ns]").astype(np.int64) / 1e9
+            else:
+                our_harp_times[mask] = unit_times
 
         n_matched = np.sum(~np.isnan(our_harp_times))
         n_total = len(our_harp_times)
@@ -1155,12 +1164,17 @@ def validate_synced_spikes_against_ground_truth():
                 f"({n_total - n_matched} unmatched)"
             )
 
-        # Compare — gt_harp_times might be in different units (HARP seconds vs datetime)
-        # First check what Dario's values look like
+        # Compare — convert ground truth to same units (float64 seconds since epoch)
+        gt_for_compare = gt_harp_times.flatten()
+        if np.issubdtype(gt_for_compare.dtype, np.datetime64):
+            gt_for_compare = gt_for_compare.astype("datetime64[ns]").astype(np.int64) / 1e9
+        else:
+            gt_for_compare = gt_for_compare.astype(np.float64)
+
         gt_sample = gt_harp_times[:5]
         our_sample = our_harp_times[:5]
-        print_info(f"  Ground truth sample: {gt_sample}")
-        print_info(f"  Our pipeline sample: {our_sample}")
+        print_info(f"  Ground truth sample (raw): {gt_sample}")
+        print_info(f"  Our pipeline sample (seconds): {our_sample}")
 
         # Compute differences for matched spikes
         valid = ~np.isnan(our_harp_times)
@@ -1168,7 +1182,7 @@ def validate_synced_spikes_against_ground_truth():
             print_fail(f"  {grp['name']}: No valid comparisons")
             continue
 
-        diffs = our_harp_times[valid] - gt_harp_times.flatten()[valid].astype(np.float64)
+        diffs = our_harp_times[valid] - gt_for_compare[valid]
         abs_diffs = np.abs(diffs)
 
         print_info(f"  Difference stats (our - ground_truth):")
