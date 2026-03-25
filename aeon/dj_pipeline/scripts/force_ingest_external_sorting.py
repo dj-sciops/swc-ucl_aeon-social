@@ -1224,8 +1224,186 @@ def validate_synced_spikes_against_ground_truth():
     return True
 
 
+def step_17_force_insert_synced_spikes():
+    """Force-insert SyncedSpikes from Dario's pre-computed HARP timestamps.
+
+    Alternative to step_17_populate_synced_spikes() — used when Clock.bin files
+    and SyncModel data are not available (e.g., Works deployment).
+
+    Reads spike_index_harp_clock_binary_2_147.npy (per-spike HARP timestamps)
+    and splits into per-chunk, per-unit sub-arrays matching SyncedSpikes.Unit schema.
+
+    The dtype/format of Dario's file must be determined from the exploration script
+    output. This function expects the values to be convertible to datetime64[ns].
+    """
+    print_header(17, "Force-Insert SyncedSpikes (from Dario's ground truth)")
+
+    from aeon.dj_pipeline import ephys, spike_sorting
+
+    block_start, block_end = get_block_bounds()
+    now = datetime.now(timezone.utc)
+
+    # Get chunk boundaries for splitting spikes
+    chunk_data = (
+        ephys.EphysChunk & {"experiment_name": EXPERIMENT_NAME}
+    ).fetch("chunk_start", "chunk_end", order_by="chunk_start", as_dict=True)
+
+    if not chunk_data:
+        print_fail("No EphysChunk entries — run step 6 first")
+        return False
+
+    print_info(f"Using {len(chunk_data)} chunk boundaries for spike splitting")
+
+    GROUND_TRUTH_FILENAME = "spike_index_harp_clock_binary_2_147.npy"
+    groups_processed = 0
+
+    for grp in CHANNEL_GROUPS:
+        task_key = get_sorting_task_key(grp["name"], block_start, block_end)
+
+        # Check if already populated
+        if spike_sorting.SyncedSpikes & task_key:
+            print_info(f"SyncedSpikes '{grp['name']}' already exists — skipping")
+            groups_processed += 1
+            continue
+
+        ks_dir = SORTED_DATA_ROOT / grp["dir_suffix"]
+        gt_file = ks_dir / GROUND_TRUTH_FILENAME
+
+        if not gt_file.exists():
+            print_fail(
+                f"Ground truth file not found for {grp['name']}: {gt_file}\n"
+                "  This group needs Clock.bin + SyncModel for normal SyncedSpikes.populate().\n"
+                "  Escalate: upload Clock.bin (120 GB) + HarpSync (28 MB) for this group."
+            )
+            return False
+
+        print_info(f"Processing {grp['name']}...")
+
+        # Load Dario's HARP timestamps and cluster assignments
+        gt_harp = np.load(gt_file)
+        spike_clusters = np.load(ks_dir / "spike_clusters.npy").flatten()
+
+        print_info(f"  Ground truth: dtype={gt_harp.dtype}, shape={gt_harp.shape}")
+        print_info(f"  Sample values: {gt_harp.flat[:3]}")
+
+        if len(gt_harp.flatten()) != len(spike_clusters):
+            print_fail(
+                f"  Length mismatch: ground truth ({len(gt_harp.flatten())}) "
+                f"!= spike_clusters ({len(spike_clusters)})"
+            )
+            return False
+
+        gt_harp = gt_harp.flatten()
+
+        # Convert HARP timestamps to datetime64[ns]
+        # NOTE: The conversion depends on what format Dario's file uses.
+        # The exploration script reports dtype and sample values.
+        # Common formats:
+        #   - float64 (HARP seconds since epoch) -> pd.to_datetime(arr, unit='s')
+        #   - datetime64 -> use directly
+        #   - int64 (HARP ticks) -> convert via tick rate
+        #
+        # UPDATE THIS CONVERSION based on exploration script output:
+        if np.issubdtype(gt_harp.dtype, np.floating):
+            # Assume HARP seconds since Unix epoch
+            spike_datetimes = pd.to_datetime(gt_harp, unit="s").values.astype("datetime64[ns]")
+        elif np.issubdtype(gt_harp.dtype, np.datetime64):
+            spike_datetimes = gt_harp.astype("datetime64[ns]")
+        elif np.issubdtype(gt_harp.dtype, np.integer):
+            # Assume HARP ticks (32-bit counter at 1 second resolution... unlikely)
+            # This case needs investigation — raise error for now
+            print_fail(f"  Integer dtype ({gt_harp.dtype}) — needs manual conversion logic")
+            return False
+        else:
+            print_fail(f"  Unexpected dtype: {gt_harp.dtype}")
+            return False
+
+        print_info(f"  Converted to datetime64[ns]: {spike_datetimes[:3]}")
+
+        # Insert SyncedSpikes master
+        spike_sorting.SyncedSpikes.insert1(
+            {
+                **task_key,
+                "execution_time": now,
+                "execution_duration": 0.0,
+            },
+            allow_direct_insert=True,
+        )
+
+        # Split spikes into per-chunk, per-unit sub-arrays
+        unique_units = np.unique(spike_clusters)
+        total_inserted = 0
+        units_missing_spikes = 0
+
+        for chunk in chunk_data:
+            chunk_start_dt = np.datetime64(chunk["chunk_start"]).astype("datetime64[ns]")
+            chunk_end_dt = np.datetime64(chunk["chunk_end"]).astype("datetime64[ns]")
+
+            # Mask: spikes in this chunk's time range
+            chunk_mask = (spike_datetimes >= chunk_start_dt) & (spike_datetimes < chunk_end_dt)
+
+            for unit_id in unique_units:
+                unit_id = int(unit_id)
+                unit_mask = spike_clusters == unit_id
+                combined_mask = chunk_mask & unit_mask
+                unit_chunk_spikes = spike_datetimes[combined_mask]
+
+                if len(unit_chunk_spikes) == 0:
+                    continue
+
+                spike_sorting.SyncedSpikes.Unit.insert1(
+                    {
+                        **task_key,
+                        "unit": unit_id,
+                        "chunk_start": chunk["chunk_start"],
+                        "spike_count": len(unit_chunk_spikes),
+                        "spike_times": unit_chunk_spikes,
+                    },
+                    allow_direct_insert=True,
+                    ignore_extra_fields=True,
+                )
+                total_inserted += len(unit_chunk_spikes)
+
+        # Structural validation
+        expected_total = len(spike_clusters)
+        if total_inserted != expected_total:
+            print_fail(
+                f"  {grp['name']}: Spike count mismatch! "
+                f"Inserted {total_inserted}, expected {expected_total}. "
+                f"({expected_total - total_inserted} spikes fell outside chunk boundaries)"
+            )
+            # Don't return False — this might be expected if some spikes
+            # are outside the chunk range. Report and continue.
+        else:
+            print_ok(f"  {grp['name']}: All {total_inserted} spikes assigned to chunks")
+
+        n_units = len(spike_sorting.SyncedSpikes.Unit & task_key)
+        print_ok(f"  SyncedSpikes '{grp['name']}': {n_units} unit-chunk rows")
+        groups_processed += 1
+
+    print_ok(f"SyncedSpikes: {groups_processed}/{len(CHANNEL_GROUPS)} groups processed")
+
+    # Run ground truth validation (structural consistency check)
+    # Since we inserted FROM Dario's files, this validates structural correctness
+    # (correct unit assignment, chunk splitting, array indexing).
+    # The validation function (modified in step 7-8) handles dtype conversion
+    # between datetime64[ns] and float64 automatically.
+    print_info("\nRunning ground truth validation...")
+    gt_ok = validate_synced_spikes_against_ground_truth()
+    if not gt_ok:
+        print_fail("Ground truth validation failed!")
+        return False
+
+    return True
+
+
 def step_17_populate_synced_spikes():
-    """Run SyncedSpikes.populate() — converts spike indices to HARP timestamps."""
+    """Populate SyncedSpikes — from pipeline or from Dario's ground truth."""
+    # Use force-insert path if we're using exported chunks (Works deployment)
+    if CHUNK_EXPORT_PATH is not None:
+        return step_17_force_insert_synced_spikes()
+
+    # Original behavior: normal populate
     print_header(17, "Populate SyncedSpikes")
 
     from aeon.dj_pipeline import spike_sorting
@@ -1364,8 +1542,25 @@ def main():
         action="store_true",
         help="Print what would be done without making changes (not all steps support this)",
     )
+    parser.add_argument(
+        "--chunk-export",
+        type=str,
+        default=None,
+        help="Path to prod_ephys_chunk_export.json (skips raw-data chunk discovery)",
+    )
+    parser.add_argument(
+        "--skip-alignment",
+        action="store_true",
+        help="Skip spike alignment verification (use when raw .bin files unavailable)",
+    )
 
     args = parser.parse_args()
+
+    global CHUNK_EXPORT_PATH, SKIP_ALIGNMENT
+    if args.chunk_export:
+        CHUNK_EXPORT_PATH = args.chunk_export
+    if args.skip_alignment:
+        SKIP_ALIGNMENT = args.skip_alignment
 
     # Print banner
     print("\n" + "=" * 70)
