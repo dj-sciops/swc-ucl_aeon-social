@@ -41,7 +41,7 @@ import pandas as pd
 EXPERIMENT_NAME = "social-ephys0.1-aeon3"
 SUBJECT = "BAA-1104292"
 PROBE_SERIAL = "NP2004-001"  # From prior test data
-PROBE_TYPE = "neuropixels2.0_beta"
+PROBE_TYPE = "neuropixels - NP2004"
 PROBE_LABEL = "ProbeA"
 ELECTRODE_CONFIG_NAME = "0-383"  # Full probe, 384 electrodes
 EPOCH_START = "2024-06-04 10:24:07"  # From directory name
@@ -1069,49 +1069,50 @@ def step_16_auto_approve_curation():
 
 
 def validate_synced_spikes_against_ground_truth():
-    """Compare our SyncedSpikes output against Dario's pre-computed HARP timestamps.
+    """Cross-validate SyncedSpikes against Dario's uint64 HARP tick files.
 
-    Dario (darioc) pre-computed HARP-synchronized spike times and saved them as
-    `spike_index_harp_clock_binary_2_147.npy` alongside the KS output. These files
-    are per-spike arrays (same length as spike_times.npy) containing HARP clock
-    timestamps. They exist for at least Chs_1_144 and Chs_241_384.
+    We insert SyncedSpikes from spike_times_sync_binary_2_147.npy (float64 HARP
+    seconds). This function validates against an independent representation:
+    spike_index_harp_clock_binary_2_147.npy (uint64 HARP ticks at 250 MHz).
 
-    This function:
-    1. Loads Dario's ground truth file for each available channel group
-    2. Fetches our SyncedSpikes timestamps from the DB
-    3. Reconstructs per-spike HARP times by repeating chunk-level times per unit
-    4. Compares the two — if they match, our clock conversion is correct
+    If both representations agree (after unit conversion), our insertion is correct.
 
-    This is the strongest possible validation that our spike times are correct
-    relative to behavior data (both use the same HARP clock).
+    Steps per channel group:
+    1. Load uint64 HARP ticks, convert to float64 seconds (ticks / 250e6)
+    2. Fetch our SyncedSpikes datetime64[ns] from the DB, convert to float64 seconds
+    3. Reconstruct per-spike order using spike_clusters (same unit→spike mapping)
+    4. Compare — should match within floating-point precision
     """
     from aeon.dj_pipeline import spike_sorting
 
+    HARP_TICK_RATE = 250e6  # 250 MHz
+
     block_start, block_end = get_block_bounds()
 
-    GROUND_TRUTH_FILENAME = "spike_index_harp_clock_binary_2_147.npy"
+    TICK_FILENAME = "spike_index_harp_clock_binary_2_147.npy"
     groups_checked = 0
     groups_passed = 0
 
     for grp in CHANNEL_GROUPS:
         ks_dir = SORTED_DATA_ROOT / grp["dir_suffix"]
-        gt_file = ks_dir / GROUND_TRUTH_FILENAME
-        if not gt_file.exists():
-            print_info(f"  {grp['name']}: No ground truth file — skipping")
+        tick_file = ks_dir / TICK_FILENAME
+        if not tick_file.exists():
+            print_info(f"  {grp['name']}: No tick file ({TICK_FILENAME}) — skipping")
             continue
 
         groups_checked += 1
-        print_info(f"  {grp['name']}: Loading ground truth ({gt_file.stat().st_size / 1e9:.2f} GB)...")
+        print_info(f"  {grp['name']}: Loading tick file ({tick_file.stat().st_size / 1e9:.2f} GB)...")
 
-        # Load Dario's pre-computed HARP timestamps (one per spike)
-        gt_harp_times = np.load(gt_file)
-        spike_times_raw = np.load(ks_dir / "spike_times.npy").flatten()
+        # Load uint64 HARP ticks and convert to float64 seconds
+        gt_ticks = np.load(tick_file).flatten()
+        gt_seconds = gt_ticks.astype(np.float64) / HARP_TICK_RATE
+
         spike_clusters = np.load(ks_dir / "spike_clusters.npy").flatten()
 
-        if len(gt_harp_times) != len(spike_times_raw):
+        if len(gt_ticks) != len(spike_clusters):
             print_fail(
-                f"  {grp['name']}: Ground truth length ({len(gt_harp_times)}) != "
-                f"spike_times length ({len(spike_times_raw)})"
+                f"  {grp['name']}: Tick file length ({len(gt_ticks)}) != "
+                f"spike_clusters length ({len(spike_clusters)})"
             )
             continue
 
@@ -1126,16 +1127,15 @@ def validate_synced_spikes_against_ground_truth():
             continue
 
         # Rebuild per-spike timestamps from our pipeline output
-        # SyncedSpikes stores spike_times per unit — we need to interleave them
-        # back into the original spike order (matching spike_times.npy order)
+        # SyncedSpikes stores spike_times per (unit, chunk) — reconstruct original order
         unit_map = {u["unit"]: u["spike_times"] for u in synced_units}
 
         # Determine if pipeline times are datetime64 (direct-insert path) or float64
         sample_times = next(iter(unit_map.values()))
         pipeline_is_datetime = np.issubdtype(sample_times.dtype, np.datetime64)
 
-        our_harp_times = np.empty(len(spike_times_raw), dtype=np.float64)
-        our_harp_times[:] = np.nan  # sentinel for unmatched spikes
+        our_seconds = np.empty(len(spike_clusters), dtype=np.float64)
+        our_seconds[:] = np.nan  # sentinel for unmatched spikes
 
         for unit_id, unit_times in unit_map.items():
             mask = spike_clusters == unit_id
@@ -1145,77 +1145,69 @@ def validate_synced_spikes_against_ground_truth():
                     f"(KS: {mask.sum()}, pipeline: {len(unit_times)})"
                 )
                 continue
-            # Convert datetime64[ns] to float64 seconds since Unix epoch
+            # Convert to float64 seconds
             if pipeline_is_datetime:
-                our_harp_times[mask] = unit_times.astype("datetime64[ns]").astype(np.int64) / 1e9
+                our_seconds[mask] = unit_times.astype("datetime64[ns]").astype(np.int64) / 1e9
             else:
-                our_harp_times[mask] = unit_times
+                our_seconds[mask] = unit_times
 
-        n_matched = np.sum(~np.isnan(our_harp_times))
-        n_total = len(our_harp_times)
+        n_matched = np.sum(~np.isnan(our_seconds))
+        n_total = len(our_seconds)
         if n_matched < n_total:
             print_info(
                 f"  {grp['name']}: {n_matched}/{n_total} spikes matched "
                 f"({n_total - n_matched} unmatched)"
             )
 
-        # Compare — convert ground truth to same units (float64 seconds since epoch)
-        gt_for_compare = gt_harp_times.flatten()
-        if np.issubdtype(gt_for_compare.dtype, np.datetime64):
-            gt_for_compare = gt_for_compare.astype("datetime64[ns]").astype(np.int64) / 1e9
-        else:
-            gt_for_compare = gt_for_compare.astype(np.float64)
-
-        gt_sample = gt_harp_times[:5]
-        our_sample = our_harp_times[:5]
-        print_info(f"  Ground truth sample (raw): {gt_sample}")
-        print_info(f"  Our pipeline sample (seconds): {our_sample}")
+        print_info(f"  Tick file sample (ticks): {gt_ticks[:3]}")
+        print_info(f"  Tick file sample (seconds): {gt_seconds[:3]}")
+        print_info(f"  Our pipeline sample (seconds): {our_seconds[:3]}")
 
         # Compute differences for matched spikes
-        valid = ~np.isnan(our_harp_times)
+        valid = ~np.isnan(our_seconds)
         if not np.any(valid):
             print_fail(f"  {grp['name']}: No valid comparisons")
             continue
 
-        diffs = our_harp_times[valid] - gt_for_compare[valid]
+        diffs = our_seconds[valid] - gt_seconds[valid]
         abs_diffs = np.abs(diffs)
 
-        print_info(f"  Difference stats (our - ground_truth):")
-        print_info(f"    Mean:   {np.mean(diffs):.6f}")
-        print_info(f"    Median: {np.median(diffs):.6f}")
-        print_info(f"    Max:    {np.max(abs_diffs):.6f}")
-        print_info(f"    Std:    {np.std(diffs):.6f}")
-        print_info(f"    P99:    {np.percentile(abs_diffs, 99):.6f}")
+        print_info(f"  Difference stats (pipeline - ticks):")
+        print_info(f"    Mean:   {np.mean(diffs):.9f}")
+        print_info(f"    Median: {np.median(diffs):.9f}")
+        print_info(f"    Max:    {np.max(abs_diffs):.9f}")
+        print_info(f"    Std:    {np.std(diffs):.9f}")
+        print_info(f"    P99:    {np.percentile(abs_diffs, 99):.9f}")
 
-        # Threshold: if max difference > 1 second, something is very wrong
-        # If < 1ms, we're golden. Between 1ms and 1s, investigate.
+        # Threshold: these are two representations of the same data, so differences
+        # should be tiny (floating-point precision). 1ms tolerance is generous.
         max_diff = np.max(abs_diffs)
         if max_diff < 0.001:  # < 1ms
-            print_ok(f"  {grp['name']}: PASS — max difference < 1ms ({max_diff:.6f}s)")
+            print_ok(f"  {grp['name']}: PASS — max difference < 1ms ({max_diff:.9f}s)")
             groups_passed += 1
         elif max_diff < 1.0:  # < 1s
             print_info(
-                f"  {grp['name']}: WARN — max difference {max_diff:.4f}s "
-                "(within 1s but investigate if units differ)"
+                f"  {grp['name']}: WARN — max difference {max_diff:.6f}s "
+                "(within 1s but investigate unit conversion)"
             )
-            groups_passed += 1  # still count as passed, might be unit conversion
+            groups_passed += 1
         else:
             print_fail(
                 f"  {grp['name']}: FAIL — max difference {max_diff:.2f}s. "
-                "Spike times do NOT match ground truth!"
+                "Float64 seconds and uint64 ticks do NOT agree!"
             )
 
     if groups_checked == 0:
-        print_info("No ground truth files found — skipping validation")
-        print_info(f"(Expected: {GROUND_TRUTH_FILENAME} in channel group directories)")
+        print_info("No tick files found — skipping cross-validation")
+        print_info(f"(Expected: {TICK_FILENAME} in channel group directories)")
         return True  # not a failure, just no data to compare
 
-    print_info(f"\nGround truth validation: {groups_passed}/{groups_checked} groups passed")
+    print_info(f"\nCross-validation: {groups_passed}/{groups_checked} groups passed")
     if groups_passed < groups_checked:
-        print_fail("Some channel groups failed ground truth validation!")
+        print_fail("Some channel groups failed cross-validation!")
         return False
 
-    print_ok("All available ground truth comparisons passed!")
+    print_ok("All available cross-validations passed!")
     return True
 
 
@@ -1225,11 +1217,11 @@ def step_17_force_insert_synced_spikes():
     Alternative to step_17_populate_synced_spikes() — used when Clock.bin files
     and SyncModel data are not available (e.g., Works deployment).
 
-    Reads spike_index_harp_clock_binary_2_147.npy (per-spike HARP timestamps)
+    Reads spike_times_sync_binary_2_147.npy (float64 HARP seconds, one per spike)
     and splits into per-chunk, per-unit sub-arrays matching SyncedSpikes.Unit schema.
 
-    The dtype/format of Dario's file must be determined from the exploration script
-    output. This function expects the values to be convertible to datetime64[ns].
+    Channel groups missing this file are skipped with a warning (e.g., Chs_193_240
+    has no sync data — needs Thinh/Dario to generate it).
     """
     print_header(17, "Force-Insert SyncedSpikes (from Dario's ground truth)")
 
@@ -1249,8 +1241,13 @@ def step_17_force_insert_synced_spikes():
 
     print_info(f"Using {len(chunk_data)} chunk boundaries for spike splitting")
 
-    GROUND_TRUTH_FILENAME = "spike_index_harp_clock_binary_2_147.npy"
+    # Dario's pre-converted HARP timestamps (float64 seconds since HARP epoch).
+    # These are the end result of: sample_index → Clock.bin (ONIX) → SyncModel (HARP).
+    # The uint64 tick files (spike_index_harp_clock_binary_2_147.npy) are at 250 MHz
+    # and are used for cross-validation only.
+    SYNC_FILENAME = "spike_times_sync_binary_2_147.npy"
     groups_processed = 0
+    groups_skipped = []
 
     for grp in CHANNEL_GROUPS:
         task_key = get_sorting_task_key(grp["name"], block_start, block_end)
@@ -1262,56 +1259,35 @@ def step_17_force_insert_synced_spikes():
             continue
 
         ks_dir = SORTED_DATA_ROOT / grp["dir_suffix"]
-        gt_file = ks_dir / GROUND_TRUTH_FILENAME
+        sync_file = ks_dir / SYNC_FILENAME
 
-        if not gt_file.exists():
-            print_fail(
-                f"Ground truth file not found for {grp['name']}: {gt_file}\n"
-                "  This group needs Clock.bin + SyncModel for normal SyncedSpikes.populate().\n"
-                "  Escalate: upload Clock.bin (120 GB) + HarpSync (28 MB) for this group."
+        if not sync_file.exists():
+            print_info(
+                f"  {grp['name']}: No sync file ({SYNC_FILENAME}) — skipping.\n"
+                "    This group needs Thinh/Dario to generate the sync file,\n"
+                "    or Clock.bin (120 GB) must be uploaded to use SyncModel."
             )
-            return False
+            groups_skipped.append(grp["name"])
+            continue
 
         print_info(f"Processing {grp['name']}...")
 
-        # Load Dario's HARP timestamps and cluster assignments
-        gt_harp = np.load(gt_file)
+        # Load Dario's HARP seconds and cluster assignments
+        harp_seconds = np.load(sync_file).flatten()
         spike_clusters = np.load(ks_dir / "spike_clusters.npy").flatten()
 
-        print_info(f"  Ground truth: dtype={gt_harp.dtype}, shape={gt_harp.shape}")
-        print_info(f"  Sample values: {gt_harp.flat[:3]}")
+        print_info(f"  Sync file: dtype={harp_seconds.dtype}, shape={harp_seconds.shape}")
+        print_info(f"  Sample values: {harp_seconds[:3]}")
 
-        if len(gt_harp.flatten()) != len(spike_clusters):
+        if len(harp_seconds) != len(spike_clusters):
             print_fail(
-                f"  Length mismatch: ground truth ({len(gt_harp.flatten())}) "
+                f"  Length mismatch: sync file ({len(harp_seconds)}) "
                 f"!= spike_clusters ({len(spike_clusters)})"
             )
             return False
 
-        gt_harp = gt_harp.flatten()
-
-        # Convert HARP timestamps to datetime64[ns]
-        # NOTE: The conversion depends on what format Dario's file uses.
-        # The exploration script reports dtype and sample values.
-        # Common formats:
-        #   - float64 (HARP seconds since epoch) -> pd.to_datetime(arr, unit='s')
-        #   - datetime64 -> use directly
-        #   - int64 (HARP ticks) -> convert via tick rate
-        #
-        # UPDATE THIS CONVERSION based on exploration script output:
-        if np.issubdtype(gt_harp.dtype, np.floating):
-            # Assume HARP seconds since Unix epoch
-            spike_datetimes = pd.to_datetime(gt_harp, unit="s").values.astype("datetime64[ns]")
-        elif np.issubdtype(gt_harp.dtype, np.datetime64):
-            spike_datetimes = gt_harp.astype("datetime64[ns]")
-        elif np.issubdtype(gt_harp.dtype, np.integer):
-            # Assume HARP ticks (32-bit counter at 1 second resolution... unlikely)
-            # This case needs investigation — raise error for now
-            print_fail(f"  Integer dtype ({gt_harp.dtype}) — needs manual conversion logic")
-            return False
-        else:
-            print_fail(f"  Unexpected dtype: {gt_harp.dtype}")
-            return False
+        # Convert float64 HARP seconds to datetime64[ns]
+        spike_datetimes = pd.to_datetime(harp_seconds, unit="s").values.astype("datetime64[ns]")
 
         print_info(f"  Converted to datetime64[ns]: {spike_datetimes[:3]}")
 
@@ -1375,17 +1351,18 @@ def step_17_force_insert_synced_spikes():
         print_ok(f"  SyncedSpikes '{grp['name']}': {n_units} unit-chunk rows")
         groups_processed += 1
 
+    if groups_skipped:
+        print_info(f"\nSkipped groups (no sync file): {', '.join(groups_skipped)}")
+
     print_ok(f"SyncedSpikes: {groups_processed}/{len(CHANNEL_GROUPS)} groups processed")
 
-    # Run ground truth validation (structural consistency check)
-    # Since we inserted FROM Dario's files, this validates structural correctness
-    # (correct unit assignment, chunk splitting, array indexing).
-    # The validation function (modified in step 7-8) handles dtype conversion
-    # between datetime64[ns] and float64 automatically.
-    print_info("\nRunning ground truth validation...")
+    # Cross-validate against Dario's uint64 HARP tick files (250 MHz).
+    # Since we inserted from the float64 files and the uint64 files are an
+    # independent representation of the same data, agreement confirms correctness.
+    print_info("\nRunning cross-validation against uint64 HARP tick files...")
     gt_ok = validate_synced_spikes_against_ground_truth()
     if not gt_ok:
-        print_fail("Ground truth validation failed!")
+        print_fail("Cross-validation failed!")
         return False
 
     return True

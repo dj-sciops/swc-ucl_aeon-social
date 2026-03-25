@@ -48,7 +48,16 @@ ESSENTIAL_FILES = [
     "templates.npy",
     "cluster_KSLabel.tsv",
     "params.py",
-    "spike_index_harp_clock_binary_2_147.npy",  # conditional — may not exist in all groups
+]
+
+# Conditional files — uploaded if present, not an error if missing.
+# spike_times_sync_binary_2_147.npy: Dario's pre-converted HARP seconds (float64).
+#   Used by force_ingest step 17 for SyncedSpikes insertion.
+# spike_index_harp_clock_binary_2_147.npy: Dario's uint64 HARP ticks (250 MHz).
+#   Used for cross-validation only.
+OPTIONAL_FILES = [
+    "spike_times_sync_binary_2_147.npy",
+    "spike_index_harp_clock_binary_2_147.npy",
 ]
 
 s3_session, s3_bucket = None, None
@@ -91,10 +100,16 @@ def collect_upload_manifest():
             if fpath.exists():
                 rel = fpath.relative_to(ROOT_DIR)
                 manifest.append((fpath, rel))
-            elif fname == "spike_index_harp_clock_binary_2_147.npy":
-                missing_optional.append(f"{grp}/{fname}")
             else:
                 missing_required.append(f"{grp}/{fname}")
+
+        for fname in OPTIONAL_FILES:
+            fpath = grp_dir / fname
+            if fpath.exists():
+                rel = fpath.relative_to(ROOT_DIR)
+                manifest.append((fpath, rel))
+            else:
+                missing_optional.append(f"{grp}/{fname}")
 
     return manifest, missing_required, missing_optional
 
