@@ -385,11 +385,6 @@ def step_06_import_chunks_from_export():
 
     from aeon.dj_pipeline import ephys
 
-    existing = len(ephys.EphysChunk & {"experiment_name": EXPERIMENT_NAME})
-    if existing > 0:
-        print_info(f"Already have {existing} EphysChunk entries — skipping import")
-        return True
-
     if CHUNK_EXPORT_PATH is None:
         print_fail("No --chunk-export path provided and raw data not available")
         print_info("Run explore_prod_ephys_data.py --export on HPC, then pass the JSON path here")
@@ -1333,7 +1328,6 @@ def step_17_force_insert_synced_spikes():
         # Split spikes into per-chunk, per-unit sub-arrays
         unique_units = np.unique(spike_clusters)
         total_inserted = 0
-        units_missing_spikes = 0
 
         for chunk in chunk_data:
             chunk_start_dt = np.datetime64(chunk["chunk_start"]).astype("datetime64[ns]")
