@@ -27,6 +27,9 @@ _ref_device_mapping = {
     # abcGolden01 behavior arm: CameraTop isn't part of this rig's active set,
     # so use CameraNest as the chunk-discovery reference.
     "abcGolden01-aeon3": "CameraNest",
+    # Same dataset registered as one experiment spanning both acquisition
+    # machines (AEON3 behavior + AEONX1 ephys), per docs/ephys_runbooks.
+    "abcGolden01-aeonx1": "CameraNest",
 }
 
 
