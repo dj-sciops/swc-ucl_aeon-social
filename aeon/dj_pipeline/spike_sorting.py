@@ -134,7 +134,7 @@ class PreProcessing(dj.Computed):
         -> master
         file_name: varchar(255)
         ---
-        file: <filepath@dj_store>
+        file: <filepath@general>
         """
 
     @classmethod
@@ -396,7 +396,7 @@ class SpikeSorting(dj.Computed):
         -> master
         file_name: varchar(255)
         ---
-        file: <filepath@dj_store>
+        file: <filepath@general>
         """
 
     def make_fetch(self, key):
@@ -547,7 +547,7 @@ class PostProcessing(dj.Computed):
         -> master
         file_name: varchar(255)
         ---
-        file: <filepath@dj_store>
+        file: <filepath@general>
         """
 
     def make_fetch(self, key):
@@ -679,7 +679,7 @@ class SIExport(dj.Computed):
         -> master
         file_name: varchar(255)
         ---
-        file: <filepath@dj_store>
+        file: <filepath@general>
         """
 
     def make(self, key):
@@ -750,9 +750,9 @@ class SortedSpikes(dj.Imported):
         -> ephys.ElectrodeConfig.Electrode  # electrode with highest waveform amplitude for this unit
         -> UnitQuality
         spike_count: int32       # how many spikes in this recording for this unit
-        spike_indices: <blob@dj_store>  # array of spike indices into the concatenated binary data (from preprocessing)
-        spike_sites : <blob@dj_store>   # array of electrode associated with each spike
-        spike_depths=null : <blob@dj_store>  # (um) array of depths associated with each spike, relative to the (0, 0) of the probe
+        spike_indices: <blob@general>  # array of spike indices into the concatenated binary data (from preprocessing)
+        spike_sites : <blob@general>   # array of electrode associated with each spike
+        spike_depths=null : <blob@general>  # (um) array of depths associated with each spike, relative to the (0, 0) of the probe
         """  # noqa:E501
 
     def make(self, key):
@@ -1074,7 +1074,7 @@ class SyncedSpikes(dj.Imported):
         -> ephys.EphysChunk
         ---
         spike_count: int32     # how many spikes in this recording for this unit
-        spike_times: <blob@dj_store>  # datetime64[ns] synchronized spike times (in HARP) for the EphysChunk
+        spike_times: <blob@general>  # datetime64[ns] synchronized spike times (in HARP) for the EphysChunk
         """
 
     def make(self, key: dict[str, Any]) -> None:
@@ -1248,7 +1248,7 @@ class UnitMatching(dj.Computed):
         -> GlobalUnit
         -> ephys.EphysChunk
         ---
-        spike_times: <blob@dj_store>  # datetime64[ns] (UTC), HARP-synced
+        spike_times: <blob@general>  # datetime64[ns] (UTC), HARP-synced
         spike_count: int32
         unique index (experiment_name, subject, insertion_number, global_unit, chunk_start)
         """

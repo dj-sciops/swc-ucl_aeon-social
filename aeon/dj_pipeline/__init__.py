@@ -15,7 +15,7 @@ import pandas as pd
 # MariaDB compatibility patch
 #
 # On MariaDB 10.x, the JSON type aliases to longtext. DataJoint's codec
-# columns (<filepath@dj_store>, <blob@dj_store>) produce Python dicts that
+# columns (<filepath@general>, <blob@general>) produce Python dicts that
 # DataJoint expects to serialize via json.dumps when attr.json is True.
 # On MariaDB, attr.json is False (the column reports as longtext, not json),
 # so the raw dict reaches pymysql, which raises:
