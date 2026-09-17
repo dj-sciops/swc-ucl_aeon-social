@@ -223,7 +223,7 @@ class ApplyOfficialCuration(dj.Imported):
         # handles the unit matching cleanup before we get here.
         if current_curation_id == -1:
             logger.info("Deleting old SortedSpikes (curation_id=-1) and downstream tables...")
-            (spike_sorting.SortedSpikes & key).delete(safemode=False)
+            (spike_sorting.SortedSpikes & key).delete(prompt=False)
             logger.info("Deleted SortedSpikes (downstream tables auto-deleted by DataJoint)")
 
         # Insert ApplyOfficialCuration entry
@@ -563,7 +563,7 @@ def restore_raw_sorting(key: dict) -> None:
 
     # Step 1: Delete OfficialCuration entry (cascades to ApplyOfficialCuration)
     logger.info("Deleting OfficialCuration entry...")
-    official_curation.delete(safemode=False)
+    official_curation.delete(prompt=False)
     logger.info("OfficialCuration and ApplyOfficialCuration entries deleted.")
 
     # Step 2: Delete UnitMatching for this block
@@ -572,7 +572,7 @@ def restore_raw_sorting(key: dict) -> None:
     if unit_matching_entries:
         n_um = len(unit_matching_entries)
         logger.info(f"Deleting {n_um} UnitMatching entries for this block...")
-        unit_matching_entries.delete(safemode=False)
+        unit_matching_entries.delete(prompt=False)
         logger.info("UnitMatching entries deleted (cascaded to Unit and Spikes parts).")
 
     # Step 3: Delete orphaned GlobalUnit entries
@@ -582,7 +582,7 @@ def restore_raw_sorting(key: dict) -> None:
     for gu_key in (spike_sorting.GlobalUnit & insertion_key).keys():  # noqa: SIM118
         if len(spike_sorting.UnitMatching.Unit & gu_key) == 0:
             logger.info(f"Deleting orphaned GlobalUnit {gu_key['global_unit']}...")
-            (spike_sorting.GlobalUnit & gu_key).delete(safemode=False)
+            (spike_sorting.GlobalUnit & gu_key).delete(prompt=False)
             n_orphans += 1
     if n_orphans:
         logger.info(f"Deleted {n_orphans} orphaned GlobalUnit entries.")
@@ -591,7 +591,7 @@ def restore_raw_sorting(key: dict) -> None:
     sorted_spikes_entry = spike_sorting.SortedSpikes & key
     if sorted_spikes_entry:
         logger.info("Deleting SortedSpikes entry and downstream tables...")
-        sorted_spikes_entry.delete(safemode=False)
+        sorted_spikes_entry.delete(prompt=False)
         logger.info(
             "SortedSpikes and downstream tables deleted.\n"
             "Next steps:\n"
