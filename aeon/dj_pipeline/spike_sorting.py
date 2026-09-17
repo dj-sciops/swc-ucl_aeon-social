@@ -685,6 +685,7 @@ class SIExport(dj.Computed):
     def make(self, key):
         """Export spike sorting results to standardised formats for downstream analysis and sharing."""
         import spikeinterface as si
+        import spikeinterface.exporters  # noqa: F401  — submodule is not auto-imported
 
         execution_time = datetime.now(UTC)
 
