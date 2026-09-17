@@ -164,6 +164,14 @@ class ApplyOfficialCuration(dj.Imported):
         else:
             curated_analyzer.save(folder=curated_analyzer_dir, overwrite=True)
 
+        # SpikeInterface appends the .zarr suffix when saving in zarr format, so the
+        # directory that exists is not the one composed above. Registering the
+        # un-suffixed path fails the <filepath@> existence check.
+        if not curated_analyzer_dir.exists():
+            suffixed = curated_analyzer_dir.with_suffix(".zarr")
+            if suffixed.exists():
+                curated_analyzer_dir = suffixed
+
         # Store the applied analyzer directory path in ManualCuration.File
         analyzer_file_entry = {
             **key,
