@@ -158,8 +158,12 @@ class ApplyOfficialCuration(dj.Imported):
         params = (spike_sorting.SortingParamSet & key).fetch1("params")
         save_format = params.get("save_format", "zarr")
         if save_format == "zarr":
-            if curated_analyzer_dir.exists():
-                shutil.rmtree(curated_analyzer_dir)
+            # Clear both spellings: save_as() appends .zarr, so a previous run left
+            # its output under the suffixed name and the un-suffixed check misses it,
+            # after which save_as() refuses with "Folder already exists".
+            for stale in (curated_analyzer_dir, curated_analyzer_dir.with_suffix(".zarr")):
+                if stale.exists():
+                    shutil.rmtree(stale)
             curated_analyzer.save_as(format="zarr", folder=curated_analyzer_dir)
         else:
             curated_analyzer.save(folder=curated_analyzer_dir, overwrite=True)
