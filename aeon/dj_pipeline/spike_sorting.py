@@ -751,9 +751,9 @@ class SortedSpikes(dj.Imported):
         -> ephys.ElectrodeConfig.Electrode  # electrode with highest waveform amplitude for this unit
         -> UnitQuality
         spike_count: int32       # how many spikes in this recording for this unit
-        spike_indices: <blob@general>  # array of spike indices into the concatenated binary data (from preprocessing)
-        spike_sites : <blob@general>   # array of electrode associated with each spike
-        spike_depths=null : <blob@general>  # (um) array of depths associated with each spike, relative to the (0, 0) of the probe
+        spike_indices: <blob>  # array of spike indices into the concatenated binary data (from preprocessing)
+        spike_sites : <blob>   # array of electrode associated with each spike
+        spike_depths=null : <blob>  # (um) array of depths associated with each spike, relative to the (0, 0) of the probe
         """  # noqa:E501
 
     def make(self, key):
@@ -1075,7 +1075,7 @@ class SyncedSpikes(dj.Imported):
         -> ephys.EphysChunk
         ---
         spike_count: int32     # how many spikes in this recording for this unit
-        spike_times: <blob@general>  # datetime64[ns] synchronized spike times (in HARP) for the EphysChunk
+        spike_times: <blob>  # datetime64[ns] synchronized spike times (in HARP) for the EphysChunk
         """
 
     def make(self, key: dict[str, Any]) -> None:
@@ -1249,7 +1249,7 @@ class UnitMatching(dj.Computed):
         -> GlobalUnit
         -> ephys.EphysChunk
         ---
-        spike_times: <blob@general>  # datetime64[ns] (UTC), HARP-synced
+        spike_times: <blob>  # datetime64[ns] (UTC), HARP-synced
         spike_count: int32
         unique index (experiment_name, subject, insertion_number, global_unit, chunk_start)
         """
@@ -1402,8 +1402,8 @@ class UnitMatching(dj.Computed):
             for prev_block in overlapping_blocks:
                 overlap_start = max(block_start, prev_block["block_start"])
                 overlap_end = min(block_end, prev_block["block_end"])
-                overlap_start_s = overlap_start.timestamp()
-                overlap_end_s = overlap_end.timestamp()
+                overlap_start_s = overlap_start.replace(tzinfo=UTC).timestamp()  # DB datetimes are naive UTC (HARP clock)
+                overlap_end_s = overlap_end.replace(tzinfo=UTC).timestamp()
 
                 # Load previous block's spike times (prev_block has all PK fields)
                 prev_key = prev_block
