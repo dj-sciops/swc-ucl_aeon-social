@@ -8,7 +8,10 @@ No mocking of decorator behavior - tests run against actual production patterns.
 import json
 from pathlib import Path
 
+import numpy as np
+import pandas as pd
 import pytest
+import xarray as xr
 
 # Real Reader classes from swc-aeon (aeon_api)
 from swc.aeon.io.reader import Csv, Harp, Video
@@ -84,6 +87,7 @@ def test_rig():
 # Sample Metadata Fixtures (small config files checked into git)
 # -----------------------------------------------------------------------------
 
+
 @pytest.fixture
 def foraging_abc_metadata_path():
     """Path to sample ForagingABC metadata fixture file."""
@@ -94,6 +98,23 @@ def foraging_abc_metadata_path():
 def foraging_abc_metadata(foraging_abc_metadata_path):
     """Load sample ForagingABC metadata as a dict."""
     return json.loads(foraging_abc_metadata_path.read_text())
+
+
+@pytest.fixture
+def mock_xarray_dataset():
+    """Mock an xarray.Dataset for testing the ``<xarray@xarray_store>`` codec."""
+    n, n_ch = 20, 4
+    return xr.Dataset(
+        {
+            "signal": (("time", "channel"), np.random.randn(n, n_ch).astype("float32")),
+            "flag": (("time",), np.random.rand(n) > 0.5),
+        },
+        coords={
+            "time": pd.date_range("2026-06-03", periods=n, freq="20ms"),
+            "channel": np.arange(n_ch),
+        },
+        attrs={"fs": 50.0, "note": "mock"},
+    )
 
 
 @pytest.fixture
@@ -116,3 +137,40 @@ def foraging_abc_rig(foraging_abc_metadata):
     experiment_class = get_experiment_pydantic("swc.aeon_exp.foragingABC.experiment:Experiment")
     experiment = experiment_class.model_validate(foraging_abc_metadata)
     return experiment.rig
+
+
+@pytest.fixture
+def mock_tsgroup():
+    """A pynapple TsGroup with non-contiguous keys, an empty unit, and metadata.
+
+    Deliberately awkward: unit 6 never fires, keys are not 0..N-1, the support has
+    a gap, and timestamps sit at Harp-absolute magnitude (~3.87e9 s since 1904)
+    where float64 spacing is 477 ns.
+    """
+    import pynapple as nap
+
+    t0 = 3.87e9
+    rng = np.random.default_rng(0)
+    return nap.TsGroup(
+        {
+            0: nap.Ts(t=np.sort(rng.uniform(t0, t0 + 10, 40))),
+            6: nap.Ts(t=np.array([], dtype=float)),
+            9: nap.Ts(t=np.sort(rng.uniform(t0 + 20, t0 + 30, 25))),
+        },
+        time_support=nap.IntervalSet(start=[t0, t0 + 20], end=[t0 + 10, t0 + 30]),
+        metadata={
+            "covered_seconds": np.array([10.0, 20.0, 10.0]),
+            "unit_quality": np.array(["good", "mua", "good"]),
+            "snr": np.array([12.5, 3.1, 8.0]),
+        },
+    )
+
+
+@pytest.fixture
+def mock_intervalset():
+    """A pynapple IntervalSet with per-interval metadata."""
+    import pynapple as nap
+
+    return nap.IntervalSet(
+        start=[0.0, 20.0], end=[10.0, 30.0], metadata={"tag": np.array(["wake", "sleep"])}
+    )

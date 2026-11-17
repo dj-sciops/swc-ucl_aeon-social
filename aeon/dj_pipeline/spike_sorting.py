@@ -9,6 +9,7 @@ import json
 import os
 import shutil
 import tempfile
+from collections import defaultdict
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -21,9 +22,11 @@ import pandas as pd
 from swc.aeon.io import api as io_api
 
 from aeon.dj_pipeline import get_schema_name
-from aeon.dj_pipeline.utils.ephys_utils import resolve_ephys_file
+from aeon.dj_pipeline.utils.ephys_preprocessing import resolve_preprocessing_pipeline
+from aeon.dj_pipeline.utils.ephys_utils import find_nearest_window, read_amplifier_recording, read_onix_ts
 from aeon.dj_pipeline.utils.paths import get_sorting_root_dir, scratch_recording_dir
 from aeon.dj_pipeline.utils.spike_sorting_utils import (
+    extend_clock,
     fork_safe_job_kwargs,
     resolve_analyzer_dir,
     strip_non_numeric_properties,
@@ -34,6 +37,9 @@ ephys = importlib.import_module("aeon.dj_pipeline.ephys")
 
 schema = dj.Schema(get_schema_name("spike_sorting"))
 logger = dj.logger
+
+# Neuropixels 2.0 sampling rate - TODO: read this from the metadata
+NP2_FS_HZ = 30e3
 
 
 @schema
@@ -66,11 +72,32 @@ class UnitQuality(dj.Lookup):
     unit_quality_description='':  varchar(4000)
     """
     contents = [
-        ("good", "single unit"),
-        ("ok", "probably a single unit, but could be contaminated"),
-        ("mua", "multi-unit activity"),
-        ("noise", "bad unit"),
-        ("n.a.", "not available"),
+        {"unit_quality": "good", "unit_quality_description": "single unit"},
+        {
+            "unit_quality": "ok",
+            "unit_quality_description": "probably a single unit, but could be contaminated",
+        },
+        {"unit_quality": "mua", "unit_quality_description": "multi-unit activity"},
+        {"unit_quality": "noise", "unit_quality_description": "bad unit"},
+        {"unit_quality": "n.a.", "unit_quality_description": "not available"},
+    ]
+
+
+@schema
+class CurationTag(dj.Lookup):
+    definition = """
+    # Valid non-exclusive manual-curation tags a curator can apply to a unit in the SI GUI.
+    # SortedSpikes.UnitTag foreign-keys into this; the GUI and QC read the list from here (not
+    # from a hardcoded constant). Extend by inserting rows.
+    tag: varchar(64)
+    """
+    contents = [
+        {"tag": "irregular waveform"},
+        {"tag": "amplitude drift"},
+        {"tag": "bimodal amplitude"},
+        {"tag": "intermittent"},
+        {"tag": "refractory violations"},
+        {"tag": "flag"},
     ]
 
 
@@ -83,10 +110,14 @@ class SortingMethod(dj.Lookup):
     """
 
     contents = [
-        ("kilosort2", "kilosort2 sorting method"),
-        ("kilosort2.5", "kilosort2.5 sorting method"),
-        ("kilosort3", "kilosort3 sorting method"),
-        ("kilosort4", "kilosort4 sorting method"),
+        {"sorting_method": "kilosort2", "sorting_method_desc": "kilosort2 sorting method"},
+        {"sorting_method": "kilosort2.5", "sorting_method_desc": "kilosort2.5 sorting method"},
+        {"sorting_method": "kilosort3", "sorting_method_desc": "kilosort3 sorting method"},
+        {"sorting_method": "kilosort4", "sorting_method_desc": "kilosort4 sorting method"},
+        {
+            "sorting_method": "lupin",
+            "sorting_method_desc": "lupin sorting method (SpikeInterface internal)",
+        },
     ]
 
 
@@ -134,7 +165,7 @@ class PreProcessing(dj.Computed):
         -> master
         file_name: varchar(255)
         ---
-        file: <filepath@general>
+        file: <filepath@dj_store>
         """
 
     @classmethod
@@ -173,6 +204,11 @@ class PreProcessing(dj.Computed):
 
     def make_fetch(self, key):
         """Fetch ephys data and metadata, prepare output directory, and define preprocessing parameters."""
+        # Resolve the preprocessing pipeline first, so a malformed paramset fails before
+        # anything is created on disk.
+        params = (SortingParamSet & key).fetch1("params")
+        si_pipeline = resolve_preprocessing_pipeline(params.get("SI_PREPROCESSING_PARAMS") or {})
+
         # Safety check: refuse to overwrite existing data on ceph
         output_dir = self.infer_output_dir(key)
         if output_dir.exists() and any(output_dir.iterdir()):
@@ -190,7 +226,7 @@ class PreProcessing(dj.Computed):
         ephys_files, dir_types = (
             ephys.EphysChunk.File
             & (ephys.EphysBlockInfo.Chunk & key)
-            & "file_name LIKE '%AmplifierData%.bin'"
+            & ["file_name LIKE '%AmplifierData%.bin'", "file_name LIKE '%Probe%.arrow'"]
         ).to_arrays("file_path", "directory_type", order_by="chunk_start")
 
         # Channels
@@ -201,12 +237,15 @@ class PreProcessing(dj.Computed):
             * ephys.ProbeType.Electrode
             & key
         )
-        electrodes_df = electrodes_query.to_pandas().reset_index()
+        # Order explicitly: without it the row order is whatever join plan the server
+        # picks, which can flip mid-run (e.g. after an upstream write shifts the table
+        # statistics) and fail the `make_fetch` referential-integrity re-check.
+        electrodes_df = electrodes_query.to_pandas(order_by="electrode").reset_index()
         electrodes_df.drop(columns=list(key), inplace=True, errors="ignore")
 
         num_channels = len(ephys.ElectrodeConfig.Electrode & key)
-        # Neuropixels 2.0 constants - TODO: read this from the metadata
-        fs_hz = 30e3
+        fs_hz = NP2_FS_HZ
+        # Neuropixels 2.0 gain - TODO: read this from the metadata
         gain_to_uV = 3.05176
         offset_to_uV = -2048 * gain_to_uV
 
@@ -221,6 +260,8 @@ class PreProcessing(dj.Computed):
             output_dir,
             recording_file,
             recording_dir,
+            params,
+            si_pipeline,
         )
 
     def make_compute(
@@ -236,6 +277,8 @@ class PreProcessing(dj.Computed):
         output_dir: Path,
         recording_file: Path,
         recording_dir: Path,
+        params: dict[str, Any],
+        si_pipeline: dict[str, dict[str, Any]],
     ) -> tuple[Path, datetime, Path]:
         """Preprocess ephys data for spike sorting.
 
@@ -253,40 +296,32 @@ class PreProcessing(dj.Computed):
             output_dir: Output directory path
             recording_file: Path to save recording object
             recording_dir: Directory for recording files
+            params: SortingParamSet params
+            si_pipeline: SpikeInterface preprocessing pipeline dict to apply
 
         Returns:
             Tuple of (output_dir, execution_time, recording_dir)
         """
         import probeinterface as pi
         import spikeinterface as si
-        import spikeinterface.extractors as se
+
+        # registers sorters/preprocessing/exporters submodules on the package
+        import spikeinterface.full  # noqa: F401  # pyright: ignore[reportUnusedImport]
         from spikeinterface import sorters
 
         execution_time = datetime.now(UTC)
 
-        # Concatenate recordings. Each chunk file is resolved on disk: prefer the
-        # compressed .zarr twin under the processed store, else the raw .bin.
-        si_recs = []
-        for f, d in zip(ephys_files, dir_types, strict=False):
-            ephys_dir = acquisition.Experiment.get_data_directory(key, directory_type=d)
-            resolved = resolve_ephys_file(ephys_dir / f)
-            if resolved.suffix == ".zarr":
-                # The compression library writes zarr from a plain read_binary
-                # (no gains), so re-attach the gain/offset metadata the .bin
-                # branch sets, to keep the two branches equivalent.
-                si_rec = si.load(resolved)
-                si_rec.set_channel_gains(gain_to_uV)
-                si_rec.set_channel_offsets(offset_to_uV)
-            else:
-                si_rec = se.read_binary(
-                    resolved,
-                    sampling_frequency=fs_hz,
-                    dtype=np.uint16,
-                    num_channels=num_channels,
-                    gain_to_uV=gain_to_uV,
-                    offset_to_uV=offset_to_uV,
-                )
-            si_recs.append(si_rec)
+        # Concatenate the block's AmplifierData chunks (compressed .zarr twin if present).
+        si_recs = [
+            read_amplifier_recording(
+                acquisition.Experiment.get_data_directory(key, directory_type=d) / f,
+                num_channels,
+                fs_hz,
+                gain_to_uV,
+                offset_to_uV,
+            )
+            for f, d in zip(ephys_files, dir_types, strict=True)
+        ]
         si_recording = si.concatenate_recordings(si_recs)
 
         # Select channels based on the electrode group
@@ -307,8 +342,8 @@ class PreProcessing(dj.Computed):
             },
             inplace=True,
         )
-        probe_df["contact_shapes"] = "circle"
-        probe_df["radius"] = 10
+        probe_df["contact_shapes"] = "square"
+        probe_df["width"] = 12
         si_probe = pi.Probe.from_dataframe(probe_df)
 
         si_probe.set_device_channel_indices(electrodes_df["channel_idx"].values)
@@ -316,10 +351,9 @@ class PreProcessing(dj.Computed):
 
         # Run preprocessing and save results to output folder
         si_recording = si.preprocessing.unsigned_to_signed(si_recording)
-        si_recording = ephys_preproc(si_recording)
+        si_recording = si.preprocessing.apply_preprocessing_pipeline(si_recording, si_pipeline)
         si_recording.dump_to_pickle(file_path=recording_file, relative_to=output_dir)
 
-        params = (SortingParamSet & key).fetch1("params")
         save_format = params.get("save_format", "zarr")
 
         # 30s chunk_duration matches the raw standalone-compression default; it sets the
@@ -396,7 +430,7 @@ class SpikeSorting(dj.Computed):
         -> master
         file_name: varchar(255)
         ---
-        file: <filepath@general>
+        file: <filepath@dj_store>
         """
 
     def make_fetch(self, key):
@@ -449,6 +483,9 @@ class SpikeSorting(dj.Computed):
 
         import spikeinterface as si
 
+        # registers sorters/preprocessing/exporters submodules on the package
+        import spikeinterface.full  # noqa: F401  # pyright: ignore[reportUnusedImport]
+
         execution_time = datetime.now(UTC)
         sorter_name = sorting_method.replace(".", "_")
         sorting_output_dir = output_dir / "spike_sorting"
@@ -466,9 +503,15 @@ class SpikeSorting(dj.Computed):
         if sorting_method == "kilosort4" and "clear_cache" not in sorting_params:
             sorting_params["clear_cache"] = True
 
-        # Prevent SpikeInterface from re-running write_binary_recording internally:
-        # https://github.com/SpikeInterface/spikeinterface/blob/705c932/src/spikeinterface/sorters/external/kilosortbase.py#L124
-        sorting_params["skip_kilosort_preprocessing"] = False
+        if sorting_method == "kilosort4":
+            # Kilosort4 needs a flat binary file, so SpikeInterface first converts
+            # recording.zarr to recording.dat. Its default settings (1 worker, 1 s chunks)
+            # make this slow: each 1 s written re-reads a whole 30 s zarr chunk, and a 30 h
+            # block took 3-4.5 h. So use the settings PreProcessing wrote the zarr with.
+            # Values in the paramset still win, except n_jobs: it follows the job's CPU
+            # allocation, and a paramset n_jobs can only lower it.
+            job_kwargs = fork_safe_job_kwargs("30s", max_jobs=sorting_params.get("n_jobs"))
+            sorting_params = {**job_kwargs, **sorting_params, "n_jobs": job_kwargs["n_jobs"]}
 
         intermediate_dir = scratch_recording_dir(Path(recording_file).parent)
         if save_format == "zarr":
@@ -522,8 +565,11 @@ class SpikeSorting(dj.Computed):
         # recording.zarr is a large, regenerable intermediate that only sorting reads, so
         # reclaim it now. It is shared by all paramsets of this block + electrode group, so
         # skip the delete while a sibling paramset is preprocessed but not yet sorted.
+        # Both sides are projected to their primary keys: PreProcessing and SpikeSorting
+        # share the secondary attributes `execution_time` / `execution_duration`, and
+        # DataJoint 2.x rejects a join on attributes that carry no common lineage.
         shared_key = {k: v for k, v in key.items() if k != "paramset_id"}
-        if not ((PreProcessing & shared_key) - SpikeSorting):
+        if not ((PreProcessing & shared_key).proj() - SpikeSorting.proj()):
             recording_dir = (
                 get_sorting_root_dir() / (PreProcessing & key).fetch1("sorting_output_dir")
             ).parent / "recording"
@@ -547,7 +593,7 @@ class PostProcessing(dj.Computed):
         -> master
         file_name: varchar(255)
         ---
-        file: <filepath@general>
+        file: <filepath@dj_store>
         """
 
     def make_fetch(self, key):
@@ -596,6 +642,9 @@ class PostProcessing(dj.Computed):
         """
         import spikeinterface as si
 
+        # registers sorters/preprocessing/exporters submodules on the package
+        import spikeinterface.full  # noqa: F401  # pyright: ignore[reportUnusedImport]
+
         execution_time = datetime.now(UTC)
 
         si_recording: si.BaseRecording = si.load(recording_file, base_folder=output_dir)
@@ -603,7 +652,12 @@ class PostProcessing(dj.Computed):
 
         postprocessing_params = params["SI_POSTPROCESSING_PARAMS"]
 
-        job_kwargs = postprocessing_params.get("job_kwargs", fork_safe_job_kwargs("1s"))
+        # n_jobs follows the job's CPU allocation, and a paramset n_jobs can only lower it.
+        # A fixed value doesn't work: one paramset is shared by jobs with different
+        # allocations, and editing it breaks the jobs already running with it.
+        paramset_job_kwargs = postprocessing_params.get("job_kwargs", {})
+        default_job_kwargs = fork_safe_job_kwargs("1s", max_jobs=paramset_job_kwargs.get("n_jobs"))
+        job_kwargs = {**default_job_kwargs, **paramset_job_kwargs, "n_jobs": default_job_kwargs["n_jobs"]}
 
         save_format = params.get("save_format", "zarr")
         analyzer_format = "zarr" if save_format == "zarr" else "binary_folder"
@@ -629,6 +683,7 @@ class PostProcessing(dj.Computed):
             folder=analyzer_output_dir,
             sparse=True,
             overwrite=True,
+            **job_kwargs,
         )
 
         # The order of extension computation is drawn from sorting_analyzer.get_computable_extensions()
@@ -679,13 +734,15 @@ class SIExport(dj.Computed):
         -> master
         file_name: varchar(255)
         ---
-        file: <filepath@general>
+        file: <filepath@dj_store>
         """
 
     def make(self, key):
         """Export spike sorting results to standardised formats for downstream analysis and sharing."""
         import spikeinterface as si
-        import spikeinterface.exporters  # noqa: F401  — submodule is not auto-imported
+
+        # registers sorters/preprocessing/exporters submodules on the package
+        import spikeinterface.full  # noqa: F401  # pyright: ignore[reportUnusedImport]
 
         execution_time = datetime.now(UTC)
 
@@ -749,68 +806,55 @@ class SortedSpikes(dj.Imported):
         unit: int32
         ---
         -> ephys.ElectrodeConfig.Electrode  # electrode with highest waveform amplitude for this unit
-        -> UnitQuality
+        -> UnitQuality  # Kilosort's KSLabel for raw sorting; replaced by the curator's manual quality
+                        # label once an official curation is applied (single field, per the spec)
         spike_count: int32       # how many spikes in this recording for this unit
-        spike_indices: <blob>  # array of spike indices into the concatenated binary data (from preprocessing)
-        spike_sites : <blob>   # array of electrode associated with each spike
-        spike_depths=null : <blob>  # (um) array of depths associated with each spike, relative to the (0, 0) of the probe
+        spike_indices: <blob@dj_store>  # array of spike indices into the concatenated binary data (from preprocessing)
+        spike_sites : <blob@dj_store>   # electrode associated with each unit. Same for all spikes.
+        spike_depths=null : <blob@dj_store>  # (um) array of depths associated with each spike, relative to the (0, 0) of the probe
         """  # noqa:E501
+
+    class UnitTag(dj.Part):
+        definition = """
+        # Manual curation tags (non-exclusive) - one row per tag actually applied to a unit,
+        # read from the curated analyzer's per-tag boolean properties (one per CurationTag).
+        # A unit with no tags has no rows here.
+        -> master.Unit
+        -> CurationTag
+        """
 
     def make(self, key):
         """Extract units, spike times, and electrodes from sorting output; sync to HARP clock."""
         import spikeinterface as si
 
+        # registers sorters/preprocessing/exporters submodules on the package
+        import spikeinterface.full  # noqa: F401  # pyright: ignore[reportUnusedImport]
+
         execution_time = datetime.now(UTC)
 
-        sorting_root_dir = get_sorting_root_dir()
-        output_dir = sorting_root_dir / (PreProcessing & key).fetch1("sorting_output_dir")
-
-        # Get channel and electrode-site mapping
-        electrode_query = (
-            ephys.EphysBlockInfo.Channel.proj(..., "-channel_name")
-            * ephys.ElectrodeConfig.Electrode
-            * ElectrodeGroup.Electrode
-            * ephys.ProbeType.Electrode.proj("electrode_name")
-            & key
-        )
-
-        # Check if there's an official curation for this block
-        # If so, use the curated analyzer; otherwise use the raw analyzer
-        # Use lazy import to avoid circular dependency
+        # Use the official curation's analyzer if one has been applied, otherwise the raw analyzer.
+        # Only record the curation_id once its curated analyzer exists. An official curation that
+        # hasn't been applied yet (or an auto-approved one, which has no curated analyzer) stays
+        # at -1 with the raw analyzer; ApplyOfficialCuration reads curation_id to tell whether
+        # the curation has already been applied.
         curation_id = -1
-        analyzer_output_dir = resolve_analyzer_dir(output_dir)
         try:
-            # Lazy import to avoid circular dependency
-            import importlib
-
-            spike_sorting_curation_module = importlib.import_module(
-                "aeon.dj_pipeline.spike_sorting_curation"
-            )
-            official_curation = spike_sorting_curation_module.OfficialCuration & key
+            curation_module = importlib.import_module("aeon.dj_pipeline.spike_sorting_curation")
+            official_curation = curation_module.OfficialCuration & key
             if official_curation:
-                curation_id = official_curation.fetch1("curation_id")
-                # Fetch applied analyzer path from database
-                analyzer_output_dir = Path(
-                    (
-                        spike_sorting_curation_module.ManualCuration.File
-                        & key
-                        & {"curation_id": curation_id, "file_name": "curation_applied_analyzer"}
-                    )
-                    .fetch1("file")
-                    .full_path
-                )
-                logger.info(
-                    f"Using curated analyzer (curation_id={curation_id}) from: {analyzer_output_dir}"
-                )
-            else:
-                logger.info("Using raw analyzer (no official curation found)")
+                official_curation_id = official_curation.fetch1("curation_id")
+                if _find_applied_curation_analyzer(key, official_curation_id) is not None:
+                    curation_id = official_curation_id
+                else:
+                    logger.info(f"Official curation_id={official_curation_id} has no curated analyzer")
         except (dj.errors.DataJointError, ImportError, AttributeError) as e:
             # Curation module not available, table mis-named, or no official curation — use raw analyzer.
             # Narrow scope: other exceptions (network, permission, etc.) should propagate.
-            logger.info(f"Using raw analyzer (curation check failed: {e})")
+            logger.info(f"Curation check failed, using raw analyzer: {e}")
 
-        sorting_file = output_dir / "spike_sorting" / "si_sorting.pkl"
-        si_sorting_: si.sorters.BaseSorter = si.load(sorting_file, base_folder=output_dir)
+        analyzer_output_dir = _get_sorted_spikes_analyzer(key, curation_id)
+        sorting_analyzer = si.load_sorting_analyzer(folder=analyzer_output_dir, load_extensions=False)
+        unit_ids = sorting_analyzer.unit_ids
 
         self.insert1(
             {
@@ -820,80 +864,90 @@ class SortedSpikes(dj.Imported):
                 "curation_id": curation_id,
             }
         )
-        if si_sorting_.unit_ids.size == 0:
-            logger.info(f"No units found in {sorting_file}. Skipping Unit ingestion...")
+        if unit_ids.size == 0:
+            logger.info(f"No units found in {analyzer_output_dir}. Skipping Unit ingestion...")
             return
 
-        sorting_analyzer = si.load_sorting_analyzer(folder=analyzer_output_dir)
-        si_sorting = sorting_analyzer.sorting
+        property_keys = set(sorting_analyzer.sorting.get_property_keys())
 
-        # Find representative channel for each unit
-        unit_channel_indices: dict[int, np.ndarray] = si.ChannelSparsity.from_best_channels(
-            sorting_analyzer,
-            1,
-        ).unit_id_to_channel_indices
-        unit_peak_channel: dict[int, int] = {u: chn[0] for u, chn in unit_channel_indices.items()}
+        # unit_quality is a single field: the curator's manual label once an official curation has
+        # been applied (curation_id != -1, so we've loaded the curated analyzer), otherwise Kilosort's
+        # own KSLabel. The manual call lives in the curated sorting's "quality" property; the
+        # make_curation_official gate guarantees every curated unit has one, so a curated block's units
+        # all carry the human's call, with KSLabel only as a defensive fallback.
+        use_manual_quality = curation_id != -1 and "quality" in property_keys
 
-        spike_count_dict: dict[int, int] = si_sorting.count_num_spikes_per_unit()
-        # {unit: spike_count}
-
-        # create channel2electrode_map
-        electrode_map: dict[int, dict] = {elec["electrode"]: elec for elec in electrode_query.to_dicts()}
-        channel2electrode_map = {
-            chn_idx: electrode_map[int(elec_id)]
-            for chn_idx, elec_id in zip(
-                sorting_analyzer.get_probe().device_channel_indices,
-                sorting_analyzer.get_probe().contact_ids,
-                strict=False,
+        unit_quality_map = {}
+        for unit_id in unit_ids:
+            quality = (
+                (sorting_analyzer.sorting.get_unit_property(unit_id, "quality") or "").strip().lower()
+                if use_manual_quality
+                else ""
             )
-        }
-
-        # Get unit id to quality label mapping
-        cluster_quality_label_map = {
-            int(unit_id): (
-                si_sorting.get_unit_property(unit_id, "KSLabel")
-                if "KSLabel" in si_sorting.get_property_keys()
-                else "n.a."
-            )
-            for unit_id in si_sorting.unit_ids
-        }
-
-        spike_locations = sorting_analyzer.get_extension("spike_locations")
-        extremum_channel_inds = si.template_tools.get_template_extremum_channel(
-            sorting_analyzer, outputs="index"
-        )
-        spikes_df = pd.DataFrame(
-            sorting_analyzer.sorting.to_spike_vector(extremum_channel_inds=extremum_channel_inds)
-        )
-        for unit_idx, raw_unit_id in enumerate(si_sorting.unit_ids):
-            unit_id = int(raw_unit_id)
-            unit_spikes_df = spikes_df[spikes_df.unit_index == unit_idx]
-            spike_sites = np.array(
-                [channel2electrode_map[chn_idx]["electrode"] for chn_idx in unit_spikes_df.channel_index]
-            )
-            unit_spikes_loc = spike_locations.get_data()[unit_spikes_df.index]
-            _, spike_depths = zip(*unit_spikes_loc, strict=True)  # x-coordinates, y-coordinates
-            spike_indices = si_sorting.get_unit_spike_train(unit_id)
-
-            if not (len(spike_indices) == len(spike_sites) == len(spike_depths)):
-                raise ValueError(
-                    f"Unit {unit_id}: mismatched spike data lengths "
-                    f"(indices={len(spike_indices)}, sites={len(spike_sites)}, depths={len(spike_depths)})"
+            if not quality:
+                quality = (
+                    sorting_analyzer.sorting.get_unit_property(unit_id, "KSLabel")
+                    if "KSLabel" in property_keys
+                    else "n.a."
                 )
+            unit_quality_map[int(unit_id)] = quality
+
+        # get data from analyzer
+        main_channel_indices = sorting_analyzer.main_channel_indices
+        num_spikes_per_unit = sorting_analyzer.sorting.count_num_spikes_per_unit().values()
+        spike_locations_ext = sorting_analyzer.get_extension("spike_locations")
+        all_spike_locations = spike_locations_ext.get_data(outputs="by_unit")[0]
+
+        # PreProcessing names the probe's contacts after their electrode
+        # ids and the analyzer lists contacts in channel order.
+        # probe_type and electrode_config_name are already in key.
+        main_electrode_ids = sorting_analyzer.get_probe().contact_ids[main_channel_indices].astype(int)
+
+        for (
+            unit_id,
+            main_electrode_id,
+            num_spikes,
+            unit_quality,
+            spike_locations,
+        ) in zip(
+            unit_ids,
+            main_electrode_ids,
+            num_spikes_per_unit,
+            unit_quality_map.values(),
+            all_spike_locations.values(),
+            strict=True,
+        ):
+            spike_indices = sorting_analyzer.sorting.get_unit_spike_train(unit_id=unit_id)
 
             self.Unit.insert1(
                 {
                     **key,
-                    **channel2electrode_map[unit_peak_channel[unit_id]],
-                    "unit": unit_id,
-                    "unit_quality": cluster_quality_label_map[unit_id],
+                    "unit": int(unit_id),
+                    "electrode": int(main_electrode_id),
+                    "unit_quality": unit_quality,
                     "spike_indices": spike_indices,
-                    "spike_count": spike_count_dict[unit_id],
-                    "spike_sites": spike_sites,
-                    "spike_depths": spike_depths,
+                    "spike_count": num_spikes,
+                    "spike_sites": int(main_electrode_id),
+                    "spike_depths": spike_locations["y"],
                 },
                 ignore_extra_fields=True,
             )
+
+        # Manual curation tags (curated blocks only): one UnitTag row per (unit, tag) the curator
+        # applied, read from the curated analyzer's per-tag boolean properties (see CurationTag).
+        if curation_id != -1:
+            curation_tags = CurationTag.to_arrays("tag")
+            valid_tags = [tag for tag in curation_tags if tag in property_keys]
+            tag_rows = []
+            for tag in valid_tags:
+                has_tag = sorting_analyzer.sorting.get_property(tag)
+                tag_rows.extend(
+                    {**key, "unit": int(unit_id), "tag": tag}
+                    for unit_id, tagged in zip(unit_ids, has_tag, strict=True)
+                    if tagged
+                )
+            if tag_rows:
+                self.UnitTag.insert(tag_rows, ignore_extra_fields=True)
 
 
 @schema
@@ -926,83 +980,35 @@ class Waveform(dj.Imported):
         """Extract spike waveforms for each unit and electrode from sorting analyzer templates."""
         import spikeinterface as si
 
-        sorting_root_dir = get_sorting_root_dir()
-        output_dir = sorting_root_dir / (PreProcessing & key).fetch1("sorting_output_dir")
+        # registers sorters/preprocessing/exporters submodules on the package
+        import spikeinterface.full  # noqa: F401  # pyright: ignore[reportUnusedImport]
 
-        # Get channel and electrode-site mapping
-        electrode_query = (
-            ephys.EphysBlockInfo.Channel.proj(..., "-channel_name")
-            * ephys.ElectrodeConfig.Electrode
-            * ElectrodeGroup.Electrode
-            * ephys.ProbeType.Electrode.proj("electrode_name")
-            & key
-        )
-
-        # Get curation_id from SortedSpikes to determine which analyzer to use
-        curation_id = (SortedSpikes & key).fetch1("curation_id")
-        if curation_id != -1:
-            # Fetch applied analyzer path from database
-            import importlib
-
-            spike_sorting_curation_module = importlib.import_module(
-                "aeon.dj_pipeline.spike_sorting_curation"
-            )
-            analyzer_output_dir = Path(
-                (
-                    spike_sorting_curation_module.ManualCuration.File
-                    & key
-                    & {"curation_id": curation_id, "file_name": "curation_applied_analyzer"}
-                )
-                .fetch1("file")
-                .full_path
-            )
-            logger.info(f"Using curated analyzer (curation_id={curation_id}) from: {analyzer_output_dir}")
-        else:
-            analyzer_output_dir = resolve_analyzer_dir(output_dir)
-            logger.info("Using raw analyzer (curation_id=-1)")
-
-        sorting_analyzer = si.load_sorting_analyzer(folder=analyzer_output_dir)
+        analyzer_output_dir = _get_sorted_spikes_analyzer(key, (SortedSpikes & key).fetch1("curation_id"))
+        sorting_analyzer = si.load_sorting_analyzer(folder=analyzer_output_dir, load_extensions=False)
 
         self.insert1(key)
 
-        # Find representative channel for each unit
-        unit_peak_channel: dict[int, np.ndarray] = si.ChannelSparsity.from_best_channels(
-            sorting_analyzer, 1
-        ).unit_id_to_channel_indices  # {unit: peak_channel_index}
-        unit_peak_channel = {u: chn[0] for u, chn in unit_peak_channel.items()}
-
-        # create channel2electrode_map
-        electrode_map: dict[int, dict] = {elec["electrode"]: elec for elec in electrode_query.to_dicts()}
-        channel2electrode_map = {
-            chn_idx: electrode_map[int(elec_id)]
-            for chn_idx, elec_id in zip(
-                sorting_analyzer.get_probe().device_channel_indices,
-                sorting_analyzer.get_probe().contact_ids,
-                strict=True,
-            )
-        }
-
+        probe = sorting_analyzer.get_probe()
+        electrode_ids = probe.contact_ids.astype(int)
         templates = sorting_analyzer.get_extension("templates")
 
-        for unit in (SortedSpikes.Unit & key).keys(order_by="unit"):
+        for unit in (SortedSpikes.Unit & key).proj("electrode").to_dicts(order_by="unit"):
+            main_electrode = unit.pop("electrode")
             # Get mean waveform for this unit from all channels - (sample x channel)
             unit_waveforms = templates.get_unit_template(unit_id=unit["unit"], operator="average")
-            unit_peak_waveform = {
-                **unit,
-                "unit_waveform": unit_waveforms[:, unit_peak_channel[unit["unit"]]],
+
+            channel_waveforms = {
+                elec_id: unit_waveforms[:, chn_idx]
+                for elec_id, chn_idx in zip(electrode_ids, probe.device_channel_indices, strict=True)
             }
 
-            unit_electrode_waveforms = [
-                {
-                    **unit,
-                    **channel2electrode_map[chn_idx],
-                    "channel_waveform": unit_waveforms[:, chn_idx],
-                }
-                for chn_idx in channel2electrode_map
-            ]
-
-            self.UnitWaveform.insert1(unit_peak_waveform, ignore_extra_fields=True)
-            self.ChannelWaveform.insert(unit_electrode_waveforms, ignore_extra_fields=True)
+            self.UnitWaveform.insert1({**unit, "unit_waveform": channel_waveforms[main_electrode]})
+            self.ChannelWaveform.insert(
+                [
+                    {**unit, "electrode": elec_id, "channel_waveform": waveform}
+                    for elec_id, waveform in channel_waveforms.items()
+                ]
+            )
 
 
 @schema
@@ -1023,32 +1029,10 @@ class SortingQuality(dj.Imported):
         """Extract quality metrics for each unit from sorting analyzer extensions."""
         import spikeinterface as si
 
-        sorting_root_dir = get_sorting_root_dir()
-        output_dir = sorting_root_dir / (PreProcessing & key).fetch1("sorting_output_dir")
+        # registers sorters/preprocessing/exporters submodules on the package
+        import spikeinterface.full  # noqa: F401  # pyright: ignore[reportUnusedImport]
 
-        # Get curation_id from SortedSpikes to determine which analyzer to use
-        curation_id = (SortedSpikes & key).fetch1("curation_id")
-        if curation_id != -1:
-            # Fetch applied analyzer path from database
-            import importlib
-
-            spike_sorting_curation_module = importlib.import_module(
-                "aeon.dj_pipeline.spike_sorting_curation"
-            )
-            analyzer_output_dir = Path(
-                (
-                    spike_sorting_curation_module.ManualCuration.File
-                    & key
-                    & {"curation_id": curation_id, "file_name": "curation_applied_analyzer"}
-                )
-                .fetch1("file")
-                .full_path
-            )
-            logger.info(f"Using curated analyzer (curation_id={curation_id}) from: {analyzer_output_dir}")
-        else:
-            analyzer_output_dir = resolve_analyzer_dir(output_dir)
-            logger.info("Using raw analyzer (curation_id=-1)")
-
+        analyzer_output_dir = _get_sorted_spikes_analyzer(key, (SortedSpikes & key).fetch1("curation_id"))
         sorting_analyzer = si.load_sorting_analyzer(folder=analyzer_output_dir)
 
         self.insert1(key)
@@ -1057,7 +1041,7 @@ class SortingQuality(dj.Imported):
         template_metrics = sorting_analyzer.get_extension("template_metrics").get_data()
         metrics_df = pd.concat([qc_metrics, template_metrics], axis=1)
 
-        for unit_key in (SortedSpikes.Unit & key).keys():  # noqa: SIM118
+        for unit_key in (SortedSpikes.Unit & key).keys():
             unit_qc = metrics_df.loc[unit_key["unit"]].to_dict()
             self.Metric.insert1({**unit_key, "qc_metrics": json.dumps(unit_qc, default=str)})
 
@@ -1075,7 +1059,7 @@ class SyncedSpikes(dj.Imported):
         -> ephys.EphysChunk
         ---
         spike_count: int32     # how many spikes in this recording for this unit
-        spike_times: <blob>  # datetime64[ns] synchronized spike times (in HARP) for the EphysChunk
+        spike_times: <blob@dj_store>  # datetime64[ns] synchronized spike times (in HARP) for the EphysChunk
         """
 
     def make(self, key: dict[str, Any]) -> None:
@@ -1086,7 +1070,8 @@ class SyncedSpikes(dj.Imported):
 
         Process:
         1. Load sync models for ONIX→HARP timestamp conversion
-        2. Load ONIX clock data from all ephys chunks in the block
+        2. Load ONIX clock data from all ephys chunks in the block, with chunk boundaries
+           taken from the AmplifierData sample counts the sorter saw
         3. For each unit's spike indices:
            - Map indices to corresponding ephys chunks
            - Convert indices to ONIX timestamps using clock data
@@ -1095,19 +1080,29 @@ class SyncedSpikes(dj.Imported):
 
         Args:
             key: Dictionary containing sorting task identifiers
+
+        Raises:
+            ValueError: If a Clock file is more than 1 s shorter than its AmplifierData file,
+                or if the AmplifierData files no longer add up to the recording that was sorted.
         """
+        import spikeinterface as si
+
         # Load ephys sync models
-        sync_models = {}
+        chunk_windows = defaultdict(list)  # chunk_start -> its linked (onix_ts_start, onix_ts_end, model)
         with tempfile.TemporaryDirectory() as tempdir, dj.config.override(download_path=tempdir):
             sync_ = (
                 ephys.EphysChunk.SyncModel * ephys.EphysSyncModel & (ephys.EphysBlockInfo.Chunk & key)
-            ).to_arrays("onix_ts_start", "onix_ts_end", "sync_model", order_by="onix_ts_start")
-            for s, e, m in zip(*sync_, strict=True):
-                sync_models[(s, e)] = joblib.load(m)
+            ).to_arrays(
+                "chunk_start", "onix_ts_start", "onix_ts_end", "sync_model", order_by="onix_ts_start"
+            )
+            for c, s, e, m in zip(*sync_, strict=True):
+                chunk_windows[c].append((s, e, joblib.load(m)))
 
         # Load ephys onix times
         _clock_query = (
-            ephys.EphysChunk.File & (ephys.EphysBlockInfo.Chunk & key) & "file_name LIKE '%Clock%.bin'"
+            ephys.EphysChunk.File
+            & (ephys.EphysBlockInfo.Chunk & key)
+            & ["file_name LIKE '%Clock%.bin'", "file_name LIKE '%Probe%.arrow'"]
         )
         _clock_rows = _clock_query.to_dicts(order_by="chunk_start")
         _pk = _clock_query.primary_key
@@ -1115,12 +1110,35 @@ class SyncedSpikes(dj.Imported):
         ephys_files = [r["file_path"] for r in _clock_rows]
         dir_types = [r["directory_type"] for r in _clock_rows]
 
-        onix_times = []
+        # Spike indices count samples of the AmplifierData files concatenated in PreProcessing, so
+        # the chunk boundaries come from those files, not from the Clock files. They differ when an
+        # amplifier file lost its tail e.g. due to a copying error.
+        # Its samples still start at Clock[0], so sample k of a chunk sits at Clock[k]. A Clock file
+        # that lost its tail instead is extrapolated at its own tick rate, by at most 1 s.
+        num_channels = len(ephys.ElectrodeConfig.Electrode & key)
+        onix_times, amp_lengths = [], []
         for f, d in zip(ephys_files, dir_types, strict=True):
             ephys_dir = acquisition.Experiment.get_data_directory(key, directory_type=d)
-            onix_ts = np.memmap(ephys_dir / f, mode="r", dtype=np.uint64)
-            onix_times.append(onix_ts)
-        onix_lengths = np.cumsum([len(s) for s in onix_times])
+            amp_len = read_amplifier_recording(
+                ephys_dir / f.replace("Clock", "AmplifierData"), num_channels, NP2_FS_HZ
+            ).get_num_samples()
+            onix_ts = read_onix_ts(ephys_dir / f)
+            onix_times.append(extend_clock(onix_ts, amp_len, max_extrapolation=int(NP2_FS_HZ), name=f))
+            amp_lengths.append(amp_len)
+        chunk_bounds = np.cumsum(amp_lengths)  # end of each chunk in the concatenated recording
+
+        # Guard against raw files that changed since sorting (e.g. a truncated file re-copied in
+        # full): the chunk boundaries must add up to the recording the sorter saw.
+        units = (SortedSpikes.Unit.proj("spike_indices") & key).to_dicts()
+        if units:
+            output_dir = get_sorting_root_dir() / (PreProcessing & key).fetch1("sorting_output_dir")
+            analyzer = si.load_sorting_analyzer(resolve_analyzer_dir(output_dir), load_extensions=False)
+            if chunk_bounds[-1] != analyzer.get_num_samples():
+                raise ValueError(
+                    f"The AmplifierData files of this block add up to {chunk_bounds[-1]} samples, but "
+                    f"the sorted recording has {analyzer.get_num_samples()}; the raw files changed "
+                    f"since sorting, so spike indices cannot be mapped to chunks."
+                )
 
         def indices2syncedtimes(spike_indices: np.ndarray) -> Iterator[tuple[dict[str, Any], np.ndarray]]:
             """Convert spike indices to HARP-synchronized timestamps by ephys chunk.
@@ -1134,32 +1152,34 @@ class SyncedSpikes(dj.Imported):
             Yields:
                 Tuple of (chunk_key, synced_timestamps) for each ephys chunk
             """
-            for idx, onix_bound in enumerate(onix_lengths):
+            for idx, chunk_bound in enumerate(chunk_bounds):
                 # Find spikes belonging to this ephys chunk
                 if idx == 0:
-                    spk_ind = spike_indices[spike_indices <= onix_bound]
+                    spk_ind = spike_indices[spike_indices < chunk_bound]
                 else:
                     spk_ind = spike_indices[
-                        (spike_indices > onix_lengths[idx - 1]) & (spike_indices <= onix_bound)
+                        (spike_indices >= chunk_bounds[idx - 1]) & (spike_indices < chunk_bound)
                     ]
 
                 if not len(spk_ind):  # no spikes in this chunk
                     continue
 
                 # Convert absolute indices to relative indices within this chunk
-                spk_ind -= spk_ind[0]  # make relative to chunk start
+                spk_ind = spk_ind - (chunk_bounds[idx - 1] if idx else 0)  # make relative to chunk start
                 spk_times = onix_times[idx][spk_ind]  # get ONIX timestamps
 
-                # Apply sync models to convert ONIX→HARP timestamps
-                synced_ts = []
-                for (start, end), model in sync_models.items():
-                    # Find spikes within this sync model's time window
-                    ind = np.logical_and(spk_times >= start, spk_times <= end)
-                    if not np.any(ind):
-                        continue
-                    # Convert ONIX timestamps to HARP timestamps
-                    sync_t = model.predict(spk_times[ind].reshape(-1, 1))
-                    synced_ts.extend(sync_t.flatten())
+                # Apply sync models to convert ONIX→HARP timestamps. Each spike uses the last
+                # of this chunk's sync windows starting at or before it (the first window for
+                # earlier spikes), so spikes in the 1 s gaps between HarpSync files and outside
+                # the first/last HarpSync row are extrapolated instead of dropped.
+                windows = chunk_windows[ephys_file_keys[idx]["chunk_start"]]
+                window_starts = np.array([start for start, _, _ in windows], dtype=np.uint64)
+                window_idx = find_nearest_window(window_starts, spk_times)
+                synced_ts = np.empty(len(spk_times))
+                for w in np.unique(window_idx):
+                    in_window = window_idx == w
+                    sync_t = windows[w][2].predict(spk_times[in_window].reshape(-1, 1))
+                    synced_ts[in_window] = sync_t.flatten()
 
                 synced_ts = io_api.to_datetime(synced_ts).values
                 chunk_key = ephys_file_keys[idx]
@@ -1167,7 +1187,7 @@ class SyncedSpikes(dj.Imported):
                 yield chunk_key, synced_ts
 
         self.insert1(key)
-        for unit_data in (SortedSpikes.Unit.proj("spike_indices") & key).to_dicts():
+        for unit_data in units:
             spike_indices = unit_data.pop("spike_indices")
             for ephys_chunk_key, synced_times in indices2syncedtimes(spike_indices):
                 self.Unit.insert1(
@@ -1191,10 +1211,13 @@ class UnitMatchingMethod(dj.Lookup):
     matching_method_description: varchar(1000)
     """
     contents = [
-        (
-            "spike_time_overlap",
-            "Matches units by comparing spike times during overlapping time windows between ephys blocks",
-        ),
+        {
+            "matching_method": "spike_time_overlap",
+            "matching_method_description": (
+                "Matches units by comparing spike times during overlapping time windows "
+                "between ephys blocks"
+            ),
+        },
     ]
 
 
@@ -1223,6 +1246,160 @@ class GlobalUnit(dj.Manual):
     """
 
 
+def _find_applied_curation_analyzer(key: dict, curation_id: int) -> Path | None:
+    """Return the curated analyzer folder for ``curation_id``, or None if it hasn't been applied yet."""
+    # lazy import to avoid circular imports: spike_sorting_curation imports this module
+    curation_module = importlib.import_module("aeon.dj_pipeline.spike_sorting_curation")
+    applied_analyzer = (
+        curation_module.ManualCuration.File
+        & key
+        & {"curation_id": curation_id, "file_name": "curation_applied_analyzer"}
+    )
+    return Path(applied_analyzer.fetch1("file").full_path) if applied_analyzer else None
+
+
+def _get_sorted_spikes_analyzer(key: dict, curation_id: int) -> Path:
+    """Return the analyzer folder a SortedSpikes entry was built from (curated if ``curation_id`` != -1).
+
+    Tables downstream of SortedSpikes should pass its stored ``curation_id`` so they load the same analyzer.
+    """
+    if curation_id != -1:
+        analyzer_dir = _find_applied_curation_analyzer(key, curation_id)
+        if analyzer_dir is None:
+            raise FileNotFoundError(f"No curated analyzer for curation_id={curation_id} of {key}")
+        logger.info(f"Using curated analyzer (curation_id={curation_id}) from: {analyzer_dir}")
+        return analyzer_dir
+    output_dir = get_sorting_root_dir() / (PreProcessing & key).fetch1("sorting_output_dir")
+    logger.info("Using raw analyzer (curation_id=-1)")
+    return resolve_analyzer_dir(output_dir)
+
+
+# Defaults for UnitMatchingParamSet.params - used for any key missing from a given paramset's
+# params blob, so existing paramsets (saved with params={}) keep behaving exactly as before.
+# "min_score" is our own name for compare_two_sorters' "chance_score" kwarg (pairings below it
+# are noise-level - essentially no coincident spikes relative to each unit's spike count).
+# BlockComparison stores the whole agreement-score grid regardless, so min_score no longer gates
+# what is persisted; it only feeds the comparison.
+_DEFAULT_MATCHING_PARAMS = {
+    "delta_time": 0.4,  # ms; coincidence window for compare_two_sorters
+    "match_score": 0.5,  # min agreement_score to accept a 1:1 (Hungarian) match
+    "min_score": 0.1,  # compare_two_sorters chance_score (below = noise-level)
+}
+
+
+def _resolve_matching_params(raw_params: dict) -> dict:
+    """Merge raw_params over _DEFAULT_MATCHING_PARAMS, missing keys fall back to the default.
+
+    Raises on any key not in _DEFAULT_MATCHING_PARAMS - a plain dict merge would otherwise
+    silently ignore a misspelled key (e.g. "match_scroe") instead of applying the override,
+    leaving the default in effect with no error and no indication the override didn't take.
+    """
+    unknown = set(raw_params) - set(_DEFAULT_MATCHING_PARAMS)
+    if unknown:
+        raise ValueError(
+            f"Unknown UnitMatchingParamSet.params key(s): {unknown}. "
+            f"Valid keys: {set(_DEFAULT_MATCHING_PARAMS)}"
+        )
+    return {**_DEFAULT_MATCHING_PARAMS, **raw_params}
+
+
+def _restrict_to_overlap(spike_times_s: np.ndarray, start_s: float, end_s: float) -> np.ndarray:
+    """Restrict spike times (epoch seconds) to an overlap window, relative to its start."""
+    if len(spike_times_s) == 0:
+        return np.array([])
+    mask = (spike_times_s >= start_s) & (spike_times_s <= end_s)
+    return spike_times_s[mask] - start_s
+
+
+def _load_block_unit_spike_trains(block_key: dict) -> dict[int, np.ndarray]:
+    """Return {unit_id: sorted spike times in epoch seconds} for every non-noise unit in a block.
+
+    Units the curator manually labeled "noise" (SortedSpikes.Unit.unit_quality == "noise") are
+    excluded: they are kept in SortedSpikes/SyncedSpikes but should never be matched across blocks or
+    handed a global unit id. Matching only runs on curated blocks, so unit_quality there is the
+    curator's own call; the antijoin excludes only that exact "noise" label, leaving every other label
+    (including Kilosort's own on any raw unit) loaded.
+    """
+    # .proj(): both tables declare a secondary `spike_count` with no common lineage, which
+    # DataJoint 2.x rejects (same bug class as #609).
+    non_noise_units = (SortedSpikes.Unit - {"unit_quality": "noise"}).proj()
+    chunks_by_unit: dict[int, list] = {}
+    for unit_entry in (SyncedSpikes.Unit & block_key & non_noise_units).to_dicts():
+        chunks_by_unit.setdefault(unit_entry["unit"], []).append(unit_entry["spike_times"])
+    trains: dict[int, np.ndarray] = {}
+    for unit_id, chunks in chunks_by_unit.items():
+        concatenated = np.sort(np.concatenate(chunks))
+        if concatenated.dtype.kind == "M":  # datetime64
+            concatenated = concatenated.astype("datetime64[ns]").astype(np.int64) / 1e9
+        trains[unit_id] = concatenated
+    return trains
+
+
+def _compare_spike_trains_in_overlap(
+    this_block_units: dict[int, np.ndarray],
+    prev_block_units: dict[int, np.ndarray],
+    this_block_bounds: tuple,
+    prev_block_bounds: tuple,
+    sampling_frequency: float = NP2_FS_HZ,
+    delta_time: float = 0.4,
+    match_score: float = 0.5,
+    min_score: float = 0.1,
+):
+    """Restrict both blocks' spike trains to their time overlap and compare with SpikeInterface.
+
+    `delta_time`, `match_score`, and `min_score` are passed straight through to
+    `compare_two_sorters` (`min_score` as its `chance_score` kwarg) - see
+    UnitMatchingParamSet.params / _DEFAULT_MATCHING_PARAMS.
+
+    Returns the SymmetricSortingComparison (see spikeinterface.comparison), or None if the
+    blocks don't overlap in time or neither side has any spikes in the overlap window.
+    """
+    from spikeinterface.comparison import compare_two_sorters
+    from spikeinterface.core import NumpySorting
+
+    this_start, this_end = this_block_bounds
+    prev_start, prev_end = prev_block_bounds
+    overlap_start = max(this_start, prev_start)
+    overlap_end = min(this_end, prev_end)
+    if overlap_start >= overlap_end:
+        return None
+
+    # block_start/block_end are naive datetimes (HARP/synced clock, effectively UTC).
+    # datetime.timestamp() on a naive datetime silently assumes the *system's local*
+    # timezone, not UTC - on a non-UTC machine this shifts the window enough to miss the
+    # actual overlap entirely, silently producing zero matches with no error. Attach UTC
+    # explicitly so this is correct regardless of the machine's local timezone.
+    overlap_start_s = overlap_start.replace(tzinfo=UTC).timestamp()
+    overlap_end_s = overlap_end.replace(tzinfo=UTC).timestamp()
+
+    this_spike_trains = {}
+    for uid, times in this_block_units.items():
+        restricted = _restrict_to_overlap(times, overlap_start_s, overlap_end_s)
+        if len(restricted) > 0:
+            this_spike_trains[uid] = (restricted * sampling_frequency).astype(np.int64)
+
+    prev_spike_trains = {}
+    for uid, times in prev_block_units.items():
+        restricted = _restrict_to_overlap(times, overlap_start_s, overlap_end_s)
+        if len(restricted) > 0:
+            prev_spike_trains[uid] = (restricted * sampling_frequency).astype(np.int64)
+
+    if not this_spike_trains or not prev_spike_trains:
+        return None
+
+    sorting_this = NumpySorting.from_unit_dict(this_spike_trains, sampling_frequency=sampling_frequency)
+    sorting_prev = NumpySorting.from_unit_dict(prev_spike_trains, sampling_frequency=sampling_frequency)
+    return compare_two_sorters(
+        sorting1=sorting_prev,
+        sorting2=sorting_this,
+        sorting1_name="previous",
+        sorting2_name="current",
+        delta_time=delta_time,
+        match_score=match_score,
+        chance_score=min_score,
+    )
+
+
 @schema
 class UnitMatching(dj.Computed):
     definition = """
@@ -1241,6 +1418,9 @@ class UnitMatching(dj.Computed):
         -> GlobalUnit
         match_confidence=null: float64
         match_comment='': varchar(1000)
+        matched_spike_count=null: int32  # spikes in the overlap window counted as agreeing by
+                                          # compare_two_sorters (null for newly-created global units,
+                                          # which had nothing to match against)
         """
 
     class Spikes(dj.Part):
@@ -1249,9 +1429,23 @@ class UnitMatching(dj.Computed):
         -> GlobalUnit
         -> ephys.EphysChunk
         ---
-        spike_times: <blob>  # datetime64[ns] (UTC), HARP-synced
+        spike_times: <blob@dj_store>  # datetime64[ns] (UTC), HARP-synced
         spike_count: int32
         unique index (experiment_name, subject, insertion_number, global_unit, chunk_start)
+        """
+
+    class BlockComparison(dj.Part):
+        definition = """
+        # Full agreement-score grid from compare_two_sorters between this block's units and the
+        # units of one block it was compared against - every pairing, not just those above a
+        # threshold. QC/audit only; does not affect matching or global-unit assignment. One row
+        # per block this block was compared against.
+        -> master
+        -> ephys.EphysBlock.proj(matched_block_start='block_start', matched_block_end='block_end')
+        ---
+        unit_ids: <blob>                # this block's unit ids (column order of agreement_scores)
+        matched_block_unit_ids: <blob>  # compared block's unit ids (row order of agreement_scores)
+        agreement_scores: <blob>        # 2D float64 [matched_block_unit_ids x unit_ids], Jaccard 0-1
         """
 
     @property
@@ -1313,11 +1507,19 @@ class UnitMatching(dj.Computed):
         4. Unmatched units become new global units
         5. Insert GlobalUnit, UnitMatching.Unit, UnitMatching.Spikes entries
         """
-        from spikeinterface.comparison import compare_two_sorters
-        from spikeinterface.core import NumpySorting
-
         execution_time = datetime.now(UTC)
         _matching_method = (UnitMatchingParamSet & key).fetch1("matching_method")
+        raw_params = (UnitMatchingParamSet & key).fetch1("params") or {}
+        params = _resolve_matching_params(raw_params)
+        delta_time = params["delta_time"]
+        match_score = params["match_score"]
+        min_score = params["min_score"]
+
+        logger.info(
+            f"Matching block {key['block_start']} ({key['electrode_group']}, insertion "
+            f"{key['insertion_number']}) [{_matching_method}]: delta_time={delta_time}ms  "
+            f"match_score={match_score}  min_score={min_score}"
+        )
 
         insertion_key = {k: key[k] for k in ("experiment_name", "subject", "insertion_number")}
         paramset_key = {"matching_paramset_id": key["matching_paramset_id"]}
@@ -1347,19 +1549,7 @@ class UnitMatching(dj.Computed):
                     f"There may be unprocessed intermediate blocks (check curation status)."
                 )
 
-        this_block_units = {}
-        for unit_entry in (SyncedSpikes.Unit & key).to_dicts():
-            unit_id = unit_entry["unit"]
-            if unit_id not in this_block_units:
-                this_block_units[unit_id] = []
-            this_block_units[unit_id].append(unit_entry["spike_times"])
-
-        # Concatenate spike times across chunks per unit, convert to epoch seconds
-        for unit_id in this_block_units:  # noqa: PLC0206
-            concatenated = np.sort(np.concatenate(this_block_units[unit_id]))
-            if concatenated.dtype.kind == "M":  # datetime64
-                concatenated = concatenated.astype("datetime64[ns]").astype(np.int64) / 1e9
-            this_block_units[unit_id] = concatenated
+        this_block_units = _load_block_unit_spike_trains(key)
 
         if not this_block_units:
             logger.warning(f"No synced spike data found for block {key}. Skipping.")
@@ -1379,6 +1569,13 @@ class UnitMatching(dj.Computed):
 
         # Map: this block's unit_id -> global_unit (if matched)
         unit_to_global = {}
+        # Map: this block's unit_id -> matched spike count from the comparison that produced
+        # its match (unset for newly-created global units, which had nothing to match against)
+        unit_to_match_count = {}
+        # Full agreement-score grid for each overlapping previous block, persisted to
+        # BlockComparison below (the complete matrix, no threshold) so QC can see the whole
+        # spectrum of scores - how close every unit came, not just the accepted matches.
+        block_comparison_rows = []
 
         if not previously_matched:
             logger.info("First block for this insertion — all units will be new global units.")
@@ -1388,80 +1585,70 @@ class UnitMatching(dj.Computed):
                 f"All units will be assigned new global unit IDs (no temporal overlap for matching)."
             )
 
-        def _restrict_to_overlap(spike_times_s, start_s, end_s):
-            """Restrict spike times (epoch seconds) to overlap window.
+        for prev_block in overlapping_blocks:
+            prev_key = prev_block
+            prev_units = _load_block_unit_spike_trains(prev_key)
+            if not prev_units:
+                continue
 
-            Returns times relative to start of overlap window (in seconds).
-            """
-            if len(spike_times_s) == 0:
-                return np.array([])
-            mask = (spike_times_s >= start_s) & (spike_times_s <= end_s)
-            return spike_times_s[mask] - start_s
-
-        if overlapping_blocks:
-            for prev_block in overlapping_blocks:
-                overlap_start = max(block_start, prev_block["block_start"])
-                overlap_end = min(block_end, prev_block["block_end"])
-                overlap_start_s = overlap_start.replace(tzinfo=UTC).timestamp()  # DB datetimes are naive UTC (HARP clock)
-                overlap_end_s = overlap_end.replace(tzinfo=UTC).timestamp()
-
-                # Load previous block's spike times (prev_block has all PK fields)
-                prev_key = prev_block
-                prev_units = {}
-                for unit_entry in (SyncedSpikes.Unit & prev_key).to_dicts():
-                    uid = unit_entry["unit"]
-                    if uid not in prev_units:
-                        prev_units[uid] = []
-                    prev_units[uid].append(unit_entry["spike_times"])
-                for uid in prev_units:  # noqa: PLC0206
-                    concatenated = np.sort(np.concatenate(prev_units[uid]))
-                    if concatenated.dtype.kind == "M":
-                        concatenated = concatenated.astype("datetime64[ns]").astype(np.int64) / 1e9
-                    prev_units[uid] = concatenated
-
-                if not prev_units:
-                    continue
-
-                # Build spike train dicts for the overlap window (sample indices at 30kHz)
-                this_spike_trains = {}
-                for uid, times in this_block_units.items():
-                    restricted = _restrict_to_overlap(times, overlap_start_s, overlap_end_s)
-                    if len(restricted) > 0:
-                        this_spike_trains[uid] = (restricted * 30000).astype(np.int64)
-
-                prev_spike_trains = {}
-                for uid, times in prev_units.items():
-                    restricted = _restrict_to_overlap(times, overlap_start_s, overlap_end_s)
-                    if len(restricted) > 0:
-                        prev_spike_trains[uid] = (restricted * 30000).astype(np.int64)
-
-                if not this_spike_trains or not prev_spike_trains:
-                    continue
-
-                # Compare using SpikeInterface
-                sorting_this = NumpySorting.from_unit_dict(this_spike_trains, sampling_frequency=30000)
-                sorting_prev = NumpySorting.from_unit_dict(prev_spike_trains, sampling_frequency=30000)
-                comparison = compare_two_sorters(
-                    sorting1=sorting_prev,
-                    sorting2=sorting_this,
-                    sorting1_name="previous",
-                    sorting2_name="current",
-                    delta_time=0.4,  # ms
+            comparison = _compare_spike_trains_in_overlap(
+                this_block_units,
+                prev_units,
+                (block_start, block_end),
+                (prev_block["block_start"], prev_block["block_end"]),
+                delta_time=delta_time,
+                match_score=match_score,
+                min_score=min_score,
+            )
+            if comparison is None:
+                logger.warning(
+                    f"No spike train overlap between block {key['block_start']} and "
+                    f"previous block {prev_block['block_start']}. Skipping."
                 )
+                continue
 
-                # get_matching() returns (sorting1→sorting2, sorting2→sorting1)
-                prev_to_this, _ = comparison.get_matching()
-                for prev_uid, this_uid in prev_to_this.items():
-                    if this_uid == -1 or this_uid in unit_to_global:
+            # get_matching() returns (sorting1→sorting2, sorting2→sorting1)
+            prev_to_this, _ = comparison.get_matching()
+
+            # Save the full score grid for this comparison (QC/audit only - does not affect the
+            # assignment below). agreement_scores is indexed [prev/matched units x this units]
+            # and holds every pair's score regardless of min_score, so this is the whole spectrum.
+            block_comparison_rows.append(
+                {
+                    **key,
+                    "matched_block_start": prev_block["block_start"],
+                    "matched_block_end": prev_block["block_end"],
+                    "unit_ids": np.asarray(comparison.agreement_scores.columns),
+                    "matched_block_unit_ids": np.asarray(comparison.agreement_scores.index),
+                    "agreement_scores": comparison.agreement_scores.to_numpy(),
+                }
+            )
+
+            for prev_uid in comparison.agreement_scores.index:
+                for this_uid in comparison.agreement_scores.columns:
+                    score = float(comparison.agreement_scores.at[prev_uid, this_uid])
+                    if score < min_score:
                         continue
-
-                    # Look up which global unit the previous block's unit belongs to
-                    gu_match = self.Unit & {**prev_key, "unit": prev_uid}
-                    if gu_match:
-                        unit_to_global[this_uid] = gu_match.fetch1("global_unit")
+                    matched_spike_count = int(comparison.match_event_count.at[prev_uid, this_uid])
+                    is_hungarian_match = bool(prev_to_this.get(prev_uid) == this_uid)
+                    # First accepted (Hungarian) match wins - a unit is not reconsidered once
+                    # assigned, even if a later overlapping block would score higher. Blocks are
+                    # only ever compared to at most one already-processed neighbor at a time in
+                    # practice (see key_source's contiguous frontier growth + the block-overlap
+                    # geometry in step02_define_blocks.py), so this never actually competes
+                    # against a second candidate under current usage.
+                    if is_hungarian_match and this_uid not in unit_to_global:
+                        gu_match = self.Unit & {**prev_key, "unit": prev_uid}
+                        if gu_match:
+                            unit_to_global[this_uid] = gu_match.fetch1("global_unit")
+                            unit_to_match_count[this_uid] = matched_spike_count
 
         # ---- Assign new global units for unmatched units ----
-        existing_ids = (GlobalUnit & insertion_key & paramset_key).to_arrays("global_unit")
+        # GlobalUnit's primary key is (ProbeInsertion, global_unit) - it does NOT include
+        # matching_paramset_id, so IDs must be unique across the whole insertion regardless of
+        # paramset (e.g. when different shanks use different matching_paramset_id values),
+        # not restarted per paramset - otherwise this collides with another paramset's IDs.
+        existing_ids = (GlobalUnit & insertion_key).to_arrays("global_unit")
         next_gu_id = int(existing_ids.max()) + 1 if len(existing_ids) > 0 else 1
         n_matched = len(unit_to_global)
 
@@ -1513,6 +1700,7 @@ class UnitMatching(dj.Computed):
                     "unit": unit_id,
                     **insertion_key,
                     "global_unit": gu_id,
+                    "matched_spike_count": unit_to_match_count.get(unit_id),
                 },
                 ignore_extra_fields=True,
             )
@@ -1560,34 +1748,16 @@ class UnitMatching(dj.Computed):
                     ignore_extra_fields=True,
                 )
 
+        # ---- Insert UnitMatching.BlockComparison (full score grid, QC/audit) ----
+        if block_comparison_rows:
+            self.BlockComparison.insert(block_comparison_rows, ignore_extra_fields=True)
+
         logger.info(
             f"Unit matching complete for block {key['block_start']}:\n"
             f"  {len(unit_to_global)} units processed\n"
             f"  {n_matched} matched to existing global units\n"
             f"  {n_new} new global units created"
         )
-
-
-# ---- Ephys preprocessing with spike interface ----
-
-
-def ephys_preproc(recording) -> Any:
-    """Apply standard ephys preprocessing pipeline.
-
-    Performs unsigned-to-signed conversion, bandpass filtering (300-6000 Hz),
-    and common average referencing using median.
-
-    Args:
-        recording: SpikeInterface recording object
-
-    Returns:
-        Preprocessed recording object
-    """
-    import spikeinterface as si
-
-    recording = si.preprocessing.bandpass_filter(recording=recording, freq_min=300, freq_max=6000)
-    recording = si.preprocessing.common_reference(recording=recording, operator="median")
-    return recording
 
 
 def load_and_verify_binary_file(binary_file_path: Path, se_recording_obj: Any) -> Any:

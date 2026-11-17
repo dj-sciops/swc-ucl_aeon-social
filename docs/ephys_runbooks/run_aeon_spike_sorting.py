@@ -5,30 +5,22 @@ processes one key from the list. The SLURM script passes
 $SLURM_ARRAY_TASK_ID as --task automatically.
 
 Example output of write_spike_sorting_scripts() — golden dataset values.
-Generated for experiment "abcGolden01-aeonx1", subject "IAA-1147881".
+Generated for experiment "abcGolden01-aeon3", subject "IAA-1147881".
 
 To run a single task interactively (e.g. for debugging):
     uv run python run_aeon_spike_sorting.py --task 1
 """
 
 import argparse
-import sys
-import traceback
 
 from aeon.dj_pipeline import spike_sorting
-
-# DataJoint 2.x installs a sys.excepthook that prints only "[ERROR]: Uncaught
-# exception" with no traceback. Restore the default hook AFTER importing the
-# pipeline (DJ overwrites it at import time) so a crashed sort task logs a full
-# traceback to its SLURM .err file.
-sys.excepthook = lambda *args: traceback.print_exception(*args)
 
 # =============================================================================
 # Configuration
 # =============================================================================
 
 _base = {
-    "experiment_name": "abcGolden01-aeonx1",
+    "experiment_name": "abcGolden01-aeon3",
     "subject": "IAA-1147881",
     "insertion_number": 1,
     "probe_type": "neuropixels2.0",
@@ -38,21 +30,81 @@ _base = {
 
 keys = [
     # --- shank0 ---
-    {**_base, "electrode_group": "shank0", "block_start": "2026-05-11 07:49:46.571574", "block_end": "2026-05-11 08:19:46.571574"},
-    {**_base, "electrode_group": "shank0", "block_start": "2026-05-11 08:09:46.571574", "block_end": "2026-05-11 08:39:46.571574"},
-    {**_base, "electrode_group": "shank0", "block_start": "2026-05-11 08:29:46.571574", "block_end": "2026-05-11 08:59:46.571574"},
+    {
+        **_base,
+        "electrode_group": "shank0",
+        "block_start": "2026-05-11 07:49:46.571574",
+        "block_end": "2026-05-11 08:19:46.571574",
+    },
+    {
+        **_base,
+        "electrode_group": "shank0",
+        "block_start": "2026-05-11 08:09:46.571574",
+        "block_end": "2026-05-11 08:39:46.571574",
+    },
+    {
+        **_base,
+        "electrode_group": "shank0",
+        "block_start": "2026-05-11 08:29:46.571574",
+        "block_end": "2026-05-11 08:59:46.571574",
+    },
     # --- shank1 ---
-    {**_base, "electrode_group": "shank1", "block_start": "2026-05-11 07:49:46.571574", "block_end": "2026-05-11 08:19:46.571574"},
-    {**_base, "electrode_group": "shank1", "block_start": "2026-05-11 08:09:46.571574", "block_end": "2026-05-11 08:39:46.571574"},
-    {**_base, "electrode_group": "shank1", "block_start": "2026-05-11 08:29:46.571574", "block_end": "2026-05-11 08:59:46.571574"},
+    {
+        **_base,
+        "electrode_group": "shank1",
+        "block_start": "2026-05-11 07:49:46.571574",
+        "block_end": "2026-05-11 08:19:46.571574",
+    },
+    {
+        **_base,
+        "electrode_group": "shank1",
+        "block_start": "2026-05-11 08:09:46.571574",
+        "block_end": "2026-05-11 08:39:46.571574",
+    },
+    {
+        **_base,
+        "electrode_group": "shank1",
+        "block_start": "2026-05-11 08:29:46.571574",
+        "block_end": "2026-05-11 08:59:46.571574",
+    },
     # --- shank2 ---
-    {**_base, "electrode_group": "shank2", "block_start": "2026-05-11 07:49:46.571574", "block_end": "2026-05-11 08:19:46.571574"},
-    {**_base, "electrode_group": "shank2", "block_start": "2026-05-11 08:09:46.571574", "block_end": "2026-05-11 08:39:46.571574"},
-    {**_base, "electrode_group": "shank2", "block_start": "2026-05-11 08:29:46.571574", "block_end": "2026-05-11 08:59:46.571574"},
+    {
+        **_base,
+        "electrode_group": "shank2",
+        "block_start": "2026-05-11 07:49:46.571574",
+        "block_end": "2026-05-11 08:19:46.571574",
+    },
+    {
+        **_base,
+        "electrode_group": "shank2",
+        "block_start": "2026-05-11 08:09:46.571574",
+        "block_end": "2026-05-11 08:39:46.571574",
+    },
+    {
+        **_base,
+        "electrode_group": "shank2",
+        "block_start": "2026-05-11 08:29:46.571574",
+        "block_end": "2026-05-11 08:59:46.571574",
+    },
     # --- shank3 ---
-    {**_base, "electrode_group": "shank3", "block_start": "2026-05-11 07:49:46.571574", "block_end": "2026-05-11 08:19:46.571574"},
-    {**_base, "electrode_group": "shank3", "block_start": "2026-05-11 08:09:46.571574", "block_end": "2026-05-11 08:39:46.571574"},
-    {**_base, "electrode_group": "shank3", "block_start": "2026-05-11 08:29:46.571574", "block_end": "2026-05-11 08:59:46.571574"},
+    {
+        **_base,
+        "electrode_group": "shank3",
+        "block_start": "2026-05-11 07:49:46.571574",
+        "block_end": "2026-05-11 08:19:46.571574",
+    },
+    {
+        **_base,
+        "electrode_group": "shank3",
+        "block_start": "2026-05-11 08:09:46.571574",
+        "block_end": "2026-05-11 08:39:46.571574",
+    },
+    {
+        **_base,
+        "electrode_group": "shank3",
+        "block_start": "2026-05-11 08:29:46.571574",
+        "block_end": "2026-05-11 08:59:46.571574",
+    },
 ]
 
 # =============================================================================
@@ -71,7 +123,11 @@ CLEAR_JOB = False
 def clear_job(key):
     """Clear errored jobs for SpikeSorting to allow re-running."""
     try:
-        (spike_sorting.schema.jobs & {"table_name": spike_sorting.SpikeSorting.table_name, "status": "error"} & key).delete()
+        (
+            spike_sorting.schema.jobs
+            & {"table_name": spike_sorting.SpikeSorting.table_name, "status": "error"}
+            & key
+        ).delete()
     except Exception as e:
         print(f"[WARNING] Could not clear error jobs: {e}")
 

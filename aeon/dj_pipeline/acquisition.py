@@ -9,7 +9,11 @@ import pandas as pd
 from swc.aeon.io import api as io_api
 from swc.aeon.io import reader as io_reader
 
-from aeon.dj_pipeline import get_schema_name, lab, subject  # pyright: ignore[reportUnusedImport]
+from aeon.dj_pipeline import (
+    get_schema_name,
+    lab,  # noqa: F401  # pyright: ignore[reportUnusedImport]
+    subject,  # noqa: F401  # pyright: ignore[reportUnusedImport]
+)
 from aeon.dj_pipeline.utils import paths
 from aeon.dj_pipeline.utils.time_utils import parse_epoch_timestamp
 
@@ -27,9 +31,6 @@ _ref_device_mapping = {
     # abcGolden01 behavior arm: CameraTop isn't part of this rig's active set,
     # so use CameraNest as the chunk-discovery reference.
     "abcGolden01-aeon3": "CameraNest",
-    # Same dataset registered as one experiment spanning both acquisition
-    # machines (AEON3 behavior + AEONX1 ephys), per docs/ephys_runbooks.
-    "abcGolden01-aeonx1": "CameraNest",
 }
 
 
@@ -45,6 +46,7 @@ class ExperimentType(dj.Lookup):
     contents = [
         {"experiment_type": "foraging"},
         {"experiment_type": "social"},
+        {"experiment_type": "abc"},
     ]
 
 
@@ -253,20 +255,6 @@ class Epoch(dj.Manual):
                 raw_data_dirs,
             )
 
-            # find previous epoch end-time
-            previous_epoch_key = None
-            if i > 0:
-                previous_chunk = all_chunks.iloc[i - 1]
-                previous_chunk_path = pathlib.Path(previous_chunk.path)
-                previous_epoch_dir = pathlib.Path(previous_chunk_path.as_posix().split(device_name)[0])
-                previous_epoch_start = parse_epoch_timestamp(previous_epoch_dir.name)
-                previous_chunk_end = previous_chunk.name + datetime.timedelta(hours=io_api.CHUNK_DURATION)
-                previous_epoch_end = min(previous_chunk_end, epoch_start)
-                previous_epoch_key = {
-                    "experiment_name": experiment_name,
-                    "epoch_start": previous_epoch_start,
-                }
-
             with cls.connection.transaction:
                 # insert new epoch
                 cls.insert1(
@@ -278,12 +266,23 @@ class Epoch(dj.Manual):
                 )
                 epoch_list.append(epoch_key)
 
+                if i == 0:
+                    continue
+
+                # find previous epoch end-time
+                previous_chunk = all_chunks.iloc[i - 1]
+                previous_chunk_path = pathlib.Path(previous_chunk.path)
+                previous_epoch_dir = pathlib.Path(previous_chunk_path.as_posix().split(device_name)[0])
+                previous_epoch_start = parse_epoch_timestamp(previous_epoch_dir.name)
+                previous_chunk_end = previous_chunk.name + datetime.timedelta(hours=io_api.CHUNK_DURATION)
+                previous_epoch_end = min(previous_chunk_end, epoch_start)
+                previous_epoch_key = {
+                    "experiment_name": experiment_name,
+                    "epoch_start": previous_epoch_start,
+                }
+
                 # update previous epoch
-                if (
-                    previous_epoch_key
-                    and (cls & previous_epoch_key)
-                    and not (EpochEnd & previous_epoch_key)
-                ):
+                if (cls & previous_epoch_key) and not (EpochEnd & previous_epoch_key):
                     # insert end-time for previous epoch
                     EpochEnd.insert1(
                         {
@@ -458,7 +457,7 @@ class Chunk(dj.Manual):
         """
 
     @classmethod
-    def ingest_chunks(cls, experiment_name):
+    def ingest_chunks(cls, experiment_name, enforce_hour_completed=True):
         """Ingest data chunks for a given experiment into the database.
 
         This method processes and ingests 1-hour data acquisition chunks for a specified experiment.
@@ -472,17 +471,23 @@ class Chunk(dj.Manual):
              * Chunk end is adjusted to start of next hour (minutes/seconds/microseconds set to 0)
              * If epoch end exists, chunk end is capped at epoch end
            - Skip chunks that have already been ingested
+           - If `enforce_hour_completed` is True, skip chunks whose start is less than
+             1 hour 10 minutes ago. This avoids ingesting incomplete chunks that have
+             been partially transferred (e.g. by robocopy).
            - Collect file information for the chunk
         3. Insert all new chunks and their associated files into the database in a single transaction
 
         Args:
             experiment_name (str): Name of the experiment to ingest chunks for
+            enforce_hour_completed (bool): If True, only ingest chunks whose start is
+                at least 1 hour 10 minutes in the past (UTC).
 
         Note:
             - Chunks are 1-hour recording periods
             - Each chunk must belong to a valid epoch
             - Chunk end times are adjusted to not exceed epoch end times
             - Files are tracked relative to the repository path
+            - Chunk timestamps are recorded in UTC (London, no DST shift)
         """
         device_name = _ref_device_mapping.get(experiment_name, "CameraTop")
 
@@ -502,6 +507,15 @@ class Chunk(dj.Manual):
 
             chunk_start = chunk.name
             chunk_start = max(chunk_start, epoch_start)  # first chunk of the epoch starts at epoch_start
+
+            if enforce_hour_completed:
+                # chunk_start is naive but represents UTC (see tz_localize(None) above);
+                # attach UTC explicitly for a correct comparison against `now(UTC)`.
+                chunk_start_utc = chunk_start.replace(tzinfo=datetime.UTC)
+                time_now_utc = datetime.datetime.now(datetime.UTC)
+                if (time_now_utc - chunk_start_utc) < datetime.timedelta(hours=1, minutes=10):
+                    # Skip recently started chunks: the data may not yet be fully written/copied.
+                    continue
 
             # Calculate chunk_end using timedelta for robust date handling
             chunk_end = chunk_start + datetime.timedelta(hours=io_api.CHUNK_DURATION)
@@ -621,6 +635,12 @@ def _get_all_chunks(experiment_name, device_name):
         root=list(raw_data_dirs.values()),
         reader=io_reader.Chunk(pattern=device_name + "*", extension="csv"),
     )
+    if chunkdata.empty:
+        logger.warning(
+            f"No {device_name} chunks found for {experiment_name} in "
+            f"{', '.join(map(str, raw_data_dirs.values()))}. "
+            f"If this rig has no {device_name}, add the experiment to _ref_device_mapping."
+        )
 
     return chunkdata, raw_data_dirs
 
