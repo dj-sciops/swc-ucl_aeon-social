@@ -5,17 +5,16 @@ import logging
 import os
 from typing import cast
 
-import pymysql.converters
-
 import datajoint as dj
 import pandas as pd
+import pymysql.converters
 
 
 # ---------------------------------------------------------------------------
 # MariaDB compatibility patch
 #
 # On MariaDB 10.x, the JSON type aliases to longtext. DataJoint's codec
-# columns (<filepath@general>, <blob@general>) produce Python dicts that
+# columns (<filepath@dj_store>, <blob@dj_store>) produce Python dicts that
 # DataJoint expects to serialize via json.dumps when attr.json is True.
 # On MariaDB, attr.json is False (the column reports as longtext, not json),
 # so the raw dict reaches pymysql, which raises:
@@ -39,10 +38,14 @@ pymysql.converters.escape_dict = _escape_dict_as_json
 pymysql.converters.encoders[dict] = _escape_dict_as_json
 pymysql.converters.conversions[dict] = _escape_dict_as_json
 
-# Register Aeon codecs BEFORE any schema activation
-from aeon.dj_pipeline.utils.codec import (  # pyright: ignore[reportUnusedImport]
-    AeonStreamCodec,
-    OnixStreamCodec,
+
+# Register Aeon codecs BEFORE any schema activation. The placement below the
+# MariaDB patch is deliberate, hence the E402 suppression.
+from aeon.dj_pipeline.utils.codec import (  # noqa: E402
+    AeonStreamCodec,  # noqa: F401  # pyright: ignore[reportUnusedImport]
+    OnixStreamCodec,  # noqa: F401  # pyright: ignore[reportUnusedImport]
+    PynappleCodec,  # noqa: F401  # pyright: ignore[reportUnusedImport]
+    XArrayNetCDFCodec,  # noqa: F401  # pyright: ignore[reportUnusedImport]
 )
 
 logger = dj.logger
@@ -114,4 +117,6 @@ except ImportError:
 
         streams = dj.VirtualModule("streams", streams_maker.schema_name)
     except Exception as e:
-        logger.debug(f"Could not import streams module: {e}")
+        logger.warning(f"Could not build virtual streams module: {e}")
+except Exception as e:
+    logger.warning(f"Could not import streams module: {e}")

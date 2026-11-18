@@ -11,6 +11,8 @@ from datetime import datetime
 from pathlib import Path, PureWindowsPath
 
 import datajoint as dj
+import numpy as np
+import pyarrow.dataset as ds
 
 logger = dj.logger
 
@@ -19,6 +21,37 @@ DEVICE_PROBE_TYPE_MAP = {
     "NeuropixelsV2Beta": "neuropixels2.0_beta",
     "NeuropixelsV2": "neuropixels2.0-multishank",
 }
+
+DEVICE_NAMES = list(DEVICE_PROBE_TYPE_MAP.keys())
+
+
+def read_onix_ts(clock_file):
+    """Returns the ephys clock data as a numpy array, from either a .arrow file or a .bin file."""
+    if clock_file.suffix == ".arrow":
+        dataset = ds.dataset(clock_file, format="ipc")
+        table = dataset.to_table(columns=["Clock"])
+        onix_ts = table["Clock"].to_numpy()
+    else:
+        onix_ts = np.memmap(clock_file, mode="r", dtype=np.uint64)
+
+    return onix_ts
+
+
+def _serial_from_gain_cal(gain_cal: str | None) -> str | None:
+    r"""Extract the numeric probe serial from a GainCalibrationFileName path.
+
+    The serial is the name of the parent directory, e.g.
+    ``...\\23107805942\\23107805942_gainCalValues.csv`` -> ``"23107805942"``.
+    Returns None if absent or non-numeric.
+    """
+    if not gain_cal:
+        return None
+    try:
+        serial = PureWindowsPath(gain_cal).parent.name
+    except Exception:  # noqa: BLE001
+        logger.debug(f"Failed to extract serial from GainCalibrationFileName: {gain_cal}")
+        return None
+    return serial if serial and serial.isdigit() else None
 
 
 def resolve_ephys_file(raw_bin_path: Path) -> Path:
@@ -72,16 +105,62 @@ def resolve_ephys_file(raw_bin_path: Path) -> Path:
     raise FileNotFoundError(f"No ephys file found (checked {checked}).")
 
 
+def read_amplifier_recording(
+    raw_bin_path: Path,
+    num_channels: int,
+    fs_hz: float,
+    gain_to_uV: float = 1.0,
+    offset_to_uV: float = 0.0,
+):
+    """Read an AmplifierData file as a SpikeInterface recording.
+
+    Reads the compressed ``.zarr`` twin if present, else the raw ``.bin``
+    (see ``resolve_ephys_file``).
+    """
+    import spikeinterface as si
+    import spikeinterface.extractors as se
+
+    from aeon.dj_pipeline.utils.spike_sorting_utils import read_bonsai_onix_arrow
+
+    resolved = resolve_ephys_file(raw_bin_path)
+    if resolved.suffix == ".zarr":
+        # The compression library writes zarr from a plain read_binary (no gains),
+        # so re-attach the gain/offset metadata the .bin branch sets, to keep the
+        # two branches equivalent.
+        rec = si.load(resolved)
+        rec.set_channel_gains(gain_to_uV)
+        rec.set_channel_offsets(offset_to_uV)
+        return rec
+    elif resolved.suffix == ".arrow":
+        rec = read_bonsai_onix_arrow(
+            resolved,
+            sampling_frequency=fs_hz,
+            gain_to_uV=gain_to_uV,
+            offset_to_uV=offset_to_uV,
+        )
+        return rec
+    return se.read_binary(
+        resolved,
+        sampling_frequency=fs_hz,
+        dtype=np.uint16,
+        num_channels=num_channels,
+        gain_to_uV=gain_to_uV,
+        offset_to_uV=offset_to_uV,
+    )
+
+
 def get_probe_id(metadata: dict | None, device_name: str, probe_label: str) -> str | None:
     """Extract probe identifier from metadata.
 
     For V2Beta hardware (no serial numbers): probe ID = "{device_name}_{label}"
     For V2 hardware: probe ID = serial number from GainCalibrationFileName.
-        Returns None if the probe is disabled (Devices.ProbeX = "false").
+        Returns None if the probe is disabled.
 
-    Metadata structure (V2):
-        metadata["Devices"]["NeuropixelsV2e"]["ConfigurationA/B"]["GainCalibrationFileName"]
-        metadata["Devices"]["ProbeA/B"] = "true"/"false" (enable flag)
+    Two V2 metadata layouts are supported:
+        New (>= 2026): metadata["NeuropixelsV2A/B"] top-level device block with
+            an "Enable" flag and a single "ProbeConfiguration".
+        Old: metadata["Devices"]["NeuropixelsV2e"]["ConfigurationA/B"], with the
+            enable flag at metadata["Devices"]["ProbeA/B"] = "true"/"false".
 
     Args:
         metadata: Parsed Metadata.yml dict, or None
@@ -93,38 +172,29 @@ def get_probe_id(metadata: dict | None, device_name: str, probe_label: str) -> s
     """
     default_id = f"{device_name}_{probe_label}"
 
-    if metadata is None:
+    # Only V2 hardware carries an enable flag and a serial in its metadata
+    if metadata is None or device_name != "NeuropixelsV2":
         return default_id
 
-    devices = metadata.get("Devices", {})
+    suffix = probe_label[len("Probe") :]  # "A", "B", ...
 
-    # V2 hardware: check enable flag, then extract serial from calibration path
-    if device_name == "NeuropixelsV2":
-        # Check if probe is enabled (Devices.ProbeA/B = "true"/"false")
-        enabled = devices.get(probe_label, "true")
-        if isinstance(enabled, str) and enabled.lower() == "false":
-            return None
+    new_block = metadata.get(f"NeuropixelsV2{suffix}")
+    if isinstance(new_block, dict):
+        # New metadata format: each probe is its own top-level device block
+        # "NeuropixelsV2A"/"NeuropixelsV2B" holding a single "ProbeConfiguration";
+        # the enable flag lives inside the block.
+        enable = new_block.get("Enable", "true")
+        probe_config = new_block.get("ProbeConfiguration", {})
+    else:
+        # Old metadata format: Devices.NeuropixelsV2e.ConfigurationA/B, with the
+        # enable flag at Devices.ProbeA/B = "true"/"false".
+        devices = metadata.get("Devices", {})
+        enable = devices.get(probe_label, "true")
+        probe_config = devices.get("NeuropixelsV2e", {}).get(f"Configuration{suffix}", {})
 
-        v2e_config = devices.get("NeuropixelsV2e", {})
-        config_key_map = {
-            "ProbeA": "ConfigurationA",
-            "ProbeB": "ConfigurationB",
-        }
-        config_key = config_key_map.get(probe_label)
-        if config_key and config_key in v2e_config:
-            probe_config = v2e_config[config_key]
-            gain_cal = probe_config.get("GainCalibrationFileName")
-            if gain_cal:
-                try:
-                    serial = PureWindowsPath(gain_cal).parent.name
-                    if serial and serial.isdigit():
-                        return serial
-                except Exception:  # noqa: BLE001
-                    logger.debug(f"Failed to extract serial from GainCalibrationFileName: {gain_cal}")
-
-        return default_id
-
-    return default_id
+    if isinstance(enable, str) and enable.lower() == "false":
+        return None
+    return _serial_from_gain_cal(probe_config.get("GainCalibrationFileName")) or default_id
 
 
 def find_or_create_probe_insertion(
@@ -232,10 +302,14 @@ def read_probe_assignments(
 
     # Priority 3: Carry-forward from most recent epoch in same experiment
     previous_insertions = (
-        insertion_table
-        & {"experiment_name": key["experiment_name"]}
-        & f'epoch_start < "{key["epoch_start"]}"'
-    ).proj("probe_label", "subject").to_dicts(order_by="epoch_start DESC")
+        (
+            insertion_table
+            & {"experiment_name": key["experiment_name"]}
+            & f'epoch_start < "{key["epoch_start"]}"'
+        )
+        .proj("probe_label", "subject")
+        .to_dicts(order_by="epoch_start DESC")
+    )
 
     if previous_insertions:
         # Use only entries from the most recent epoch (first row, ordered DESC)
@@ -305,9 +379,7 @@ def _parse_probe_assignments_file(json_path: Path, probe_info: dict[str, str]) -
             )
         entry = assignments_by_serial[serial]
         if "subject" not in entry:
-            raise ValueError(
-                f"Entry for serial '{serial}' in {json_path} is missing 'subject' field."
-            )
+            raise ValueError(f"Entry for serial '{serial}' in {json_path} is missing 'subject' field.")
         result[label] = {"subject": entry["subject"]}
 
     return result
@@ -328,7 +400,7 @@ def discover_epoch_probes(epoch_path: Path) -> tuple[str | None, Path | None, li
     """
     device_name = None
     device_dir = None
-    for subdir_name in ("NeuropixelsV2Beta", "NeuropixelsV2"):
+    for subdir_name in DEVICE_NAMES:
         candidate = epoch_path / subdir_name
         if candidate.exists() and candidate.is_dir():
             device_name = subdir_name
@@ -372,11 +444,22 @@ def parse_epoch_metadata(epoch_path: Path) -> dict | None:
         return None
 
 
+def _probe_json_basename(pifn: str | None) -> str | None:
+    """Return the basename of a (possibly Windows-style) ProbeInterfaceFileName.
+
+    None/empty indicates a disabled/spoofed probe.
+    """
+    if pifn is None or pifn == "":
+        return None
+    return PureWindowsPath(pifn).name or Path(pifn).name
+
+
 def parse_metadata_probe_configs(epoch_path: Path) -> dict[str, str | None]:
     """Extract per-probe config-file basenames from an epoch's Metadata.yml.
 
-    Reads ``Devices.NeuropixelsV2e.ConfigurationA/B.ProbeInterfaceFileName``
-    and converts each entry to a (probe_label, basename) pair.
+    Reads ``ProbeInterfaceFileName`` for each probe, supporting two layouts:
+        New (>= 2026): top-level ``NeuropixelsV2A/B.ProbeConfiguration``.
+        Old: ``Devices.NeuropixelsV2e.ConfigurationA/B``.
 
     Args:
         epoch_path: Path to the epoch directory containing Metadata.yml.
@@ -393,23 +476,34 @@ def parse_metadata_probe_configs(epoch_path: Path) -> dict[str, str | None]:
     with open(metadata_path) as f:
         data = json.load(f)  # JSON despite .yml extension
 
-    npx = data.get("Devices", {}).get("NeuropixelsV2e", {})
     result: dict[str, str | None] = {}
+
+    # New metadata format: probe configs are top-level device blocks
+    # "NeuropixelsV2A"/"NeuropixelsV2B", each with a single "ProbeConfiguration".
+    new_blocks = {
+        k: v
+        for k, v in data.items()
+        if re.fullmatch(r"NeuropixelsV2[A-Z]", k) and isinstance(v, dict) and "ProbeConfiguration" in v
+    }
+    if new_blocks:
+        for dev_key, block in new_blocks.items():
+            suffix = dev_key[len("NeuropixelsV2") :]  # "A", "B", ...
+            probe_config = block.get("ProbeConfiguration") or {}
+            pifn = probe_config.get("ProbeInterfaceFileName")
+            result[f"Probe{suffix}"] = _probe_json_basename(pifn)
+        return result
+
+    # Old metadata format: Devices.NeuropixelsV2e.ConfigurationA/B.
+    npx = data.get("Devices", {}).get("NeuropixelsV2e", {})
     for cfg_key, cfg_value in npx.items():
         if not cfg_key.startswith("Configuration"):
             continue
-        suffix = cfg_key[len("Configuration"):]  # "A", "B", ...
+        suffix = cfg_key[len("Configuration") :]  # "A", "B", ...
         probe_label = f"Probe{suffix}"
         if not isinstance(cfg_value, dict):
             result[probe_label] = None
             continue
-        pifn = cfg_value.get("ProbeInterfaceFileName")
-        if pifn is None or pifn == "":
-            result[probe_label] = None
-        else:
-            # Path may be Windows-style; extract basename robustly
-            basename = PureWindowsPath(pifn).name or Path(pifn).name
-            result[probe_label] = basename
+        result[probe_label] = _probe_json_basename(cfg_value.get("ProbeInterfaceFileName"))
     return result
 
 
@@ -421,17 +515,20 @@ def resolve_epoch_probe_json(
     """Resolve a probeinterface JSON path by basename.
 
     Searches ``<raw_ephys_dir>/recording_configurations/`` (production layout)
-    first, then ``<epoch_path>/`` (local-copy fallback for test/golden data).
-    Raises FileNotFoundError if neither has the file.
+    first, then ``<epoch_path>/`` (local-copy fallback for test/golden data),
+    then ``<epoch_path>/<device_name>/`` for each known device.
+    Raises FileNotFoundError if none has the file.
     """
-    central = Path(raw_ephys_dir) / "recording_configurations" / config_file_name
-    if central.exists():
-        return central
-    epoch_local = Path(epoch_path) / config_file_name
-    if epoch_local.exists():
-        return epoch_local
+    candidate_paths = [
+        Path(raw_ephys_dir) / "recording_configurations" / config_file_name,
+        Path(epoch_path) / config_file_name,
+        *(Path(epoch_path) / device_name / config_file_name for device_name in DEVICE_NAMES),
+    ]
+    for candidate_path in candidate_paths:
+        if candidate_path.exists():
+            return candidate_path
     raise FileNotFoundError(
-        f"Probe config JSON not found at {central} or {epoch_local}"
+        f"Probe config JSON not found at any of: {', '.join(map(str, candidate_paths))}"
     )
 
 
@@ -457,8 +554,7 @@ def load_device_channel_map(json_path: Path) -> dict[int, int]:
         dci = probe.get("device_channel_indices")
         if dci is None:
             raise ValueError(
-                f"No device_channel_indices in {json_path}. "
-                f"Cannot determine hardware channel mapping."
+                f"No device_channel_indices in {json_path}. Cannot determine hardware channel mapping."
             )
         for cid, ch_idx_raw in zip(contact_ids, dci, strict=False):
             ch_idx = int(ch_idx_raw)
@@ -466,9 +562,7 @@ def load_device_channel_map(json_path: Path) -> dict[int, int]:
                 channel_map[int(cid)] = ch_idx
 
     if not channel_map:
-        raise ValueError(
-            f"No active contacts (device_channel_indices >= 0) in {json_path}."
-        )
+        raise ValueError(f"No active contacts (device_channel_indices >= 0) in {json_path}.")
 
     return channel_map
 
@@ -536,9 +630,7 @@ def create_electrode_config(
     json_path = Path(json_path)
     probe_group = pi.read_probeinterface(str(json_path))
     if len(probe_group.probes) != 1:
-        raise ValueError(
-            f"Expected exactly one probe in {json_path}, got {len(probe_group.probes)}."
-        )
+        raise ValueError(f"Expected exactly one probe in {json_path}, got {len(probe_group.probes)}.")
     probe = probe_group.probes[0]
 
     if probe_type_name is None:
@@ -565,9 +657,7 @@ def create_electrode_config(
     # No explicit transaction — callers like EphysEpochConfig.make are already
     # inside a populate() transaction, and DataJoint forbids nesting.
     probe_type_table.insert1({"probe_type": probe_type_name}, skip_duplicates=True)
-    probe_type_table.Electrode.insert(
-        electrode_df, ignore_extra_fields=True, skip_duplicates=True
-    )
+    probe_type_table.Electrode.insert(electrode_df, ignore_extra_fields=True, skip_duplicates=True)
 
     if config_name is None:
         config_name = json_path.stem
@@ -613,17 +703,13 @@ def resolve_raw_dir_and_epochs(
     from aeon.dj_pipeline.ephys import EphysEpoch, EphysEpochConfig
 
     exp_key = {"experiment_name": experiment_name}
-    raw_dir_result = acquisition.Experiment.get_data_directory(
-        exp_key, directory_type="raw-ephys"
-    )
+    raw_dir_result = acquisition.Experiment.get_data_directory(exp_key, directory_type="raw-ephys")
     if raw_dir_result is None:
         logger.error(f"raw-ephys data directory not found for {experiment_name}")
         return None
     raw_dir = Path(raw_dir_result)
 
-    ephys_epochs = (
-        EphysEpoch & exp_key & EphysEpochConfig
-    ).proj("epoch_dir").to_dicts()
+    ephys_epochs = (EphysEpoch & exp_key & EphysEpochConfig).proj("epoch_dir").to_dicts()
 
     epoch_dir_to_start: dict[str, datetime] = {}
     for ep in ephys_epochs:
@@ -640,6 +726,25 @@ def harp_to_naive(seconds: float) -> datetime:
 
     dt = io_api.to_datetime(float(seconds))
     return dt.replace(tzinfo=None) if getattr(dt, "tzinfo", None) else dt
+
+
+def find_nearest_window(window_starts, ts):
+    """Index of the last window starting at or before each ``ts``.
+
+    ``ts`` before every window resolves to index 0 (the earliest window is
+    extrapolated backward instead of leaving ``ts`` unmatched).
+
+    Args:
+        window_starts: Sorted-ascending array of window start values.
+        ts: Scalar or array of query values, same unit as ``window_starts``.
+
+    Returns:
+        Index (scalar for scalar ``ts``, array for array ``ts``) into ``window_starts``.
+    """
+    import numpy as np
+
+    idx = np.clip(np.searchsorted(window_starts, ts, side="right") - 1, 0, None)
+    return int(idx) if np.ndim(ts) == 0 else idx
 
 
 def resolve_harp(sync_row: dict, onix_ts: int, _model_cache: "dict | None" = None) -> datetime:

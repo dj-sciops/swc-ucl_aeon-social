@@ -1,5 +1,5 @@
-"""04 -- Post-Sorting and Curation
-================================
+"""04 -- Post-Sorting and Curation.
+
 After the SLURM spike sorting job completes, this script:
   1. Populates post-sorting tables (PostProcessing, SortedSpikes,
      Waveform, SortingQuality)
@@ -31,7 +31,7 @@ Run from the repo root on an HPC compute node:
 
 from datetime import UTC
 
-EXPERIMENT_NAME = "abcGolden01-aeonx1"
+EXPERIMENT_NAME = "abcGolden01-aeon3"
 
 
 # --------------------------------------------------------------------------
@@ -147,9 +147,9 @@ def auto_approve_curation(experiment_name):
     when you plan to curate later.
 
     Uses curation_id=0 with parent_curation_id=-1 and no curation file.
-    ApplyOfficialCuration detects this and simply updates the curation_id
-    on existing SortedSpikes entries -- no spike data is deleted or
-    re-computed.
+    ApplyOfficialCuration detects this and records the approval without
+    touching SortedSpikes -- it keeps curation_id=-1 (the raw sorting), and
+    no spike data is deleted or re-computed.
     """
     from datetime import datetime
 
@@ -223,9 +223,11 @@ If you want to review units interactively instead of auto-approving:
        from aeon.dj_pipeline import spike_sorting_curation as curation
        curation.ApplyOfficialCuration.populate(display_progress=True)
 
-   NOTE: Applying manual curation DELETES existing SortedSpikes and all
-   downstream entries (Waveform, SortingQuality, SyncedSpikes), then
-   re-populates them with curated data. You must re-run:
+   NOTE: Applying manual curation DELETES the existing SortedSpikes and all
+   downstream entries (Waveform, SortingQuality, SyncedSpikes). It does NOT
+   rebuild them itself - you must re-run the populates below, which reload
+   from the curated analyzer (SortedSpikes.make reads the manual quality
+   labels + tags off it into unit_quality/UnitTag):
 
        spike_sorting.SortedSpikes.populate(display_progress=True)
        spike_sorting.Waveform.populate(display_progress=True)

@@ -1,5 +1,5 @@
-"""06 -- Analysis Examples
-=======================
+"""06 -- Analysis Examples.
+
 Starter examples showing how to query spike sorting output and create
 common visualizations. These patterns are building blocks for custom
 analysis -- not a complete analysis toolkit.
@@ -40,7 +40,7 @@ Run from the repo root on an HPC compute node (Ceph must be visible):
 # Configuration -- edit these for your experiment
 # --------------------------------------------------------------------------
 
-EXPERIMENT_NAME = "abcGolden01-aeonx1"
+EXPERIMENT_NAME = "abcGolden01-aeon3"
 
 
 # --------------------------------------------------------------------------

@@ -1,5 +1,5 @@
-"""02 -- Define Blocks
-===================
+"""02 -- Define Blocks.
+
 Define time windows ("blocks") for spike sorting.
 
 Continuous ephys recordings can span many hours or even days, but spike
@@ -31,7 +31,7 @@ from datetime import timedelta
 # Configuration -- edit these for your experiment
 # --------------------------------------------------------------------------
 
-EXPERIMENT_NAME = "abcGolden01-aeonx1"
+EXPERIMENT_NAME = "abcGolden01-aeon3"
 SUBJECT = "IAA-1147881"
 
 # Test subset: small blocks for fast iteration.
